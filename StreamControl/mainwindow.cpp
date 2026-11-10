@@ -48,6 +48,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QStandardPaths>
 
 
+#include "dialogs/broadcastcontrol.h"
 #include "configwindow.h"
 #include "csv.h"
 #include "ScCompleter.h"
@@ -117,6 +118,10 @@ MainWindow::MainWindow()
 
 
     QMenu *configMenu = new QMenu();
+    QAction *actionBroadcastControl = new QAction("Countdown and Animations", this);
+    configMenu->addAction(actionBroadcastControl);
+    auto *broadcastControl = new BroadcastControl(this);
+    connect(actionBroadcastControl, &QAction::triggered, broadcastControl, &QDialog::show);
     QAction *actionConfig = new QAction("Configuration", this);
     configMenu->addAction(actionConfig);
     QAction *actionWidgetSettings = new QAction("Widget Settings", this);
