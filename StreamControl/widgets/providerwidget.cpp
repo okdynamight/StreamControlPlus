@@ -73,6 +73,8 @@ ProviderWidget::ProviderWidget(QWidget *parent,
     autoModeCheckBox = new QCheckBox();
     setMatchDataButton = new QPushButton();
     setBracketDataButton = new QPushButton();
+    setMatchDataButton->setProperty("scButtonRole", "apply");
+    setBracketDataButton->setProperty("scButtonRole", "apply");
     statusLabel = new QLabel();
 
     QFrame* frame = new QFrame();

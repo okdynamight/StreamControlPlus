@@ -29,13 +29,23 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QToolBar>
 #include <QAction>
 #include <QMenu>
+#include <QComboBox>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QVBoxLayout>
+#include <QSet>
 #include <QToolButton>
 #include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QStatusBar>
 #include <QMessageBox>
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QSettings>
 #include <QJsonValue>
 #include <QProcess>
 #include <QScrollArea>
@@ -49,8 +59,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 #include "dialogs/broadcastcontrol.h"
+#include "dialogs/bingodialog.h"
+#include "dialogs/bracketimportdialog.h"
+#include "dialogs/kevcygviewer.h"
+#include "dialogs/lockoutviewer.h"
+#include "dialogs/scheduledialog.h"
 #include "configwindow.h"
 #include "csv.h"
+#include "teamstore.h"
+#include <QCompleter>
+#include <QRegularExpression>
 #include "ScCompleter.h"
 #include "ScLineEdit.h"
 #include "ScComboBox.h"
@@ -62,6 +80,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "twitterwidget.h"
 #include "mainwindow.h"
 #include <QTimer>
+#include <functional>
+#include <QCryptographicHash>
+#include <QSignalBlocker>
+#include <QLineEdit>
+#include <QScrollArea>
 
 #ifdef Q_OS_WIN
     #include "windows.h"
@@ -71,10 +94,58 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif
 #include "win_keyhelper.h"
 
+namespace {
+// Publish a score against the last published snapshot, not the current unsaved form.
+bool publishScoreOnly(const QString &outputPath, int format, const QString &id, int value,
+                      WebSocketServer *server, QString *error) {
+    const bool writeJson=format==SC_JSON || format==SC_Both;
+    const bool writeXml=format==SC_XML || format==SC_Both;
+    if(!writeJson && !writeXml){*error=QStringLiteral("Select JSON or XML output in Configuration first.");return false;}
+    const QString jsonPath=outputPath+QStringLiteral("streamcontrol.json");
+    const QString xmlPath=outputPath+QStringLiteral("streamcontrol.xml");
+    QJsonObject snapshot; QDomDocument xml;
+    if(writeJson){
+        QFile input(jsonPath);
+        if(!input.open(QIODevice::ReadOnly)){*error=QStringLiteral("Cannot read %1. Save the dashboard once first.").arg(jsonPath);return false;}
+        QJsonParseError parse;const QJsonDocument doc=QJsonDocument::fromJson(input.readAll(),&parse);
+        if(parse.error!=QJsonParseError::NoError || !doc.isObject()){*error=QStringLiteral("The existing JSON output is invalid; no score was published.");return false;}
+        snapshot=doc.object();
+    } else if(server) {
+        QJsonParseError parse;const QJsonDocument doc=QJsonDocument::fromJson(server->lastMessage().toUtf8(),&parse);
+        if(parse.error!=QJsonParseError::NoError || !doc.isObject()){*error=QStringLiteral("No published WebSocket snapshot is available. Save the dashboard once first.");return false;}
+        snapshot=doc.object();
+    }
+    if(writeXml){
+        QFile input(xmlPath);
+        if(!input.open(QIODevice::ReadOnly)){*error=QStringLiteral("Cannot read %1. Save the dashboard once first.").arg(xmlPath);return false;}
+        if(!xml.setContent(&input) || xml.documentElement().tagName()!=QStringLiteral("items")){*error=QStringLiteral("The existing XML output is invalid; no score was published.");return false;}
+        QDomElement root=xml.documentElement();QDomElement score=root.firstChildElement(id);
+        if(score.isNull()){score=xml.createElement(id);root.appendChild(score);}
+        while(!score.firstChild().isNull())score.removeChild(score.firstChild());
+        score.appendChild(xml.createTextNode(QString::number(value)));
+    }
+    snapshot.insert(id,QString::number(value));
+    QSaveFile jsonFile(jsonPath),xmlFile(xmlPath);
+    if(writeJson){
+        const QByteArray bytes=QJsonDocument(snapshot).toJson(QJsonDocument::Indented);
+        if(!jsonFile.open(QIODevice::WriteOnly) || jsonFile.write(bytes)!=bytes.size()){*error=QStringLiteral("Could not prepare score JSON: %1").arg(jsonFile.errorString());return false;}
+    }
+    if(writeXml){
+        const QByteArray bytes=xml.toByteArray();
+        if(!xmlFile.open(QIODevice::WriteOnly) || xmlFile.write(bytes)!=bytes.size()){*error=QStringLiteral("Could not prepare score XML: %1").arg(xmlFile.errorString());return false;}
+    }
+    if(writeJson && !jsonFile.commit()){*error=QStringLiteral("Could not publish score JSON: %1").arg(jsonFile.errorString());return false;}
+    if(writeXml && !xmlFile.commit()){*error=QStringLiteral("Could not publish score XML: %1. If JSON output is enabled, it may already have been updated.").arg(xmlFile.errorString());return false;}
+    if(server)server->broadcast(QString::fromUtf8(QJsonDocument(snapshot).toJson(QJsonDocument::Compact)));
+    return true;
+}
+}
+
 MainWindow::MainWindow()
 {
     if (objectName().isEmpty())
                 setObjectName(QStringLiteral("MainWindow"));
+    setWindowTitle(tr("StreamControl Plus"));
 
     //Set up signalmappers
     resetMapper = new QSignalMapper (this) ;
@@ -118,12 +189,89 @@ MainWindow::MainWindow()
 
 
     QMenu *configMenu = new QMenu();
-    QAction *actionBroadcastControl = new QAction("Countdown and Animations", this);
-    configMenu->addAction(actionBroadcastControl);
     auto *broadcastControl = new BroadcastControl(this);
-    connect(actionBroadcastControl, &QAction::triggered, broadcastControl, &QDialog::show);
+    QAction *actionTimers = new QAction(tr("Timers"), this);
+    connect(actionTimers, &QAction::triggered, this, [broadcastControl] {
+        broadcastControl->show(); broadcastControl->raise(); broadcastControl->activateWindow();
+    });
+    QAction *actionAnimations = new QAction(tr("Broadcast Control"), this);
+    connect(actionAnimations, &QAction::triggered, broadcastControl, &BroadcastControl::showAnimations);
+    auto *bingoDialog = new BingoDialog(this);
+    QAction *actionBingo = new QAction(tr("BingoSync Viewer"), this);
+    connect(actionBingo, &QAction::triggered, this, [bingoDialog] { bingoDialog->show(); bingoDialog->raise(); bingoDialog->activateWindow(); });
+    configMenu->addAction(actionBingo);
+    auto *kevcygViewer = new KevcygViewer(this);
+    auto *actionKevcyg = new QAction(tr("Kevcyg Bingo Viewer"), this);
+    connect(actionKevcyg, &QAction::triggered, this, [kevcygViewer] { kevcygViewer->show(); kevcygViewer->raise(); kevcygViewer->activateWindow(); });
+    configMenu->addAction(actionKevcyg);
+    auto *lockoutViewer = new LockoutViewer(this);
+    QAction *actionLockout = new QAction(tr("Lockout.live Viewer"), this);
+    connect(actionLockout, &QAction::triggered, this, [lockoutViewer] { lockoutViewer->show(); lockoutViewer->raise(); lockoutViewer->activateWindow(); });
+    configMenu->addAction(actionLockout);
     QAction *actionConfig = new QAction("Configuration", this);
     configMenu->addAction(actionConfig);
+    QAction *actionSchedule = new QAction("Schedule", this);
+    auto *scheduleDialog = new ScheduleDialog(this);
+    connect(actionSchedule, &QAction::triggered, scheduleDialog, &QDialog::show);
+    scheduleDialog->setApplyToLayoutHandler([this, scheduleDialog](const QJsonObject &entry, bool configure) {
+        QStringList fields = {"scheduled_start", "game", "category", "system", "release_year", "estimate"};
+        for (int i = 1; i <= 4; ++i) fields << QString("runner_%1").arg(i) << QString("runner_%1_pronouns").arg(i)
+            << QString("runner_%1_platform").arg(i) << QString("runner_%1_service").arg(i);
+        QMap<QString, QString> defaults = {{"game","sr-game"},{"category","sr-category"},{"system","sr-platform"},
+            {"release_year","sr-release"},{"estimate","sr-estimate"}};
+        for (int i=1; i<=4; ++i) {
+            defaults[QString("runner_%1").arg(i)] = QString("sr-runner-name-%1").arg(i);
+            defaults[QString("runner_%1_pronouns").arg(i)] = QString("sr-runner-pronouns-%1").arg(i);
+            defaults[QString("runner_%1_platform").arg(i)] = QString("sr-runner-%1-platform").arg(i);
+            defaults[QString("runner_%1_service").arg(i)] = QString("sr-runner-service-%1").arg(i);
+        }
+        QSettings mappingSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("ScheduleMappings"));
+        const QByteArray hash=QCryptographicHash::hash(settings.value("layoutPath").toUtf8(), QCryptographicHash::Sha256).toHex();
+        mappingSettings.beginGroup(QString::fromLatin1(hash));
+        if (configure) {
+            QDialog dialog(scheduleDialog); dialog.setWindowTitle(tr("Configure schedule mapping")); dialog.resize(650, 650);
+            auto *outer=new QVBoxLayout(&dialog);
+            auto *note=new QLabel(tr("Choose dashboard fields for schedule columns. Mappings are saved for this layout; missing schedule columns are left unchanged."), &dialog); note->setWordWrap(true); outer->addWidget(note);
+            auto *scroll=new QScrollArea(&dialog); scroll->setWidgetResizable(true); auto *content=new QWidget(scroll); auto *form=new QFormLayout(content);
+            QMap<QString,QComboBox*> boxes;
+            for(const QString &field:fields) {
+                auto *box=new QComboBox(content); box->addItem(tr("Do not change"),QString());
+                for(auto it=widgetType.constBegin();it!=widgetType.constEnd();++it)
+                    if((it.value()=="lineEdit"||it.value()=="comboBox") && widgetList.value(it.key())) box->addItem(it.key(),it.key());
+                const QString value=mappingSettings.value(field,defaults.value(field)).toString(); const int idx=box->findData(value); if(idx>=0) box->setCurrentIndex(idx);
+                form->addRow(field,box); boxes.insert(field,box);
+            }
+            scroll->setWidget(content); outer->addWidget(scroll);
+            auto *buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);outer->addWidget(buttons);
+            connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+            if(dialog.exec()!=QDialog::Accepted)return;
+            QSet<QString> used;
+            for(const QString &field:fields){const QString id=boxes.value(field)->currentData().toString();if(!id.isEmpty() && used.contains(id)){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("Each dashboard field can only be selected once; no mapping was saved."));return;}if(!id.isEmpty())used.insert(id);}
+            for(const QString &field:fields)mappingSettings.setValue(field,boxes.value(field)->currentData().toString());
+            return;
+        }
+        QSet<QString> assigned; QJsonArray actions;
+        for(const QString &field:fields) {
+            if(!entry.contains(field)) continue;
+            const QString id=mappingSettings.value(field,defaults.value(field)).toString(); if(id.isEmpty())continue;
+            if(assigned.contains(id)){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("A dashboard field is mapped more than once. Check the mapping."));return;} assigned.insert(id);
+            const QString type=widgetType.value(id); if((type!="lineEdit"&&type!="comboBox")||!widgetList.value(id)){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("Dashboard field '%1' is missing. Configure the mapping for this layout.").arg(id));return;}
+            const QString value=entry.value(field).toString();
+            if(type=="comboBox") { auto *combo=qobject_cast<QComboBox*>(widgetList.value(id)); if(!combo || (combo->findData(value)<0 && combo->findText(value)<0 && !combo->isEditable())) {QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("The value '%1' is not available in '%2'. No fields were changed.").arg(value,id));return;} }
+            QJsonObject action;action.insert("action","set");action.insert("id",id);action.insert("value",value);actions.append(action);
+        }
+        if(actions.isEmpty()){QMessageBox::information(scheduleDialog,tr("Schedule mapping"),tr("No matching schedule fields were available. Configure the dashboard mapping."));return;}
+        for(const auto &value:actions){const QString error=applyRemoteAction(value.toObject());if(!error.isEmpty()){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("Could not apply: %1. Earlier fields may have changed.").arg(error));return;}}
+    });
+    QAction *actionSchedulePrevious = new QAction(QStringLiteral("←"), this);
+    QAction *actionScheduleApply = new QAction(tr("Apply"), this);
+    actionScheduleApply->setToolTip(tr("Apply current schedule entry to dashboard"));
+    connect(actionScheduleApply, &QAction::triggered, scheduleDialog, &ScheduleDialog::applyCurrent);
+    QAction *actionScheduleNext = new QAction(QStringLiteral("→"), this);
+    actionSchedulePrevious->setToolTip(tr("Previous schedule entry"));
+    actionScheduleNext->setToolTip(tr("Next schedule entry"));
+    connect(actionSchedulePrevious, &QAction::triggered, scheduleDialog, &ScheduleDialog::previousEntry);
+    connect(actionScheduleNext, &QAction::triggered, scheduleDialog, &ScheduleDialog::nextEntry);
     QAction *actionWidgetSettings = new QAction("Widget Settings", this);
     configMenu->addAction(actionWidgetSettings);
     QAction *actionWsConnections = new QAction("WebSocket Connections", this);
@@ -154,6 +302,19 @@ MainWindow::MainWindow()
     toolBar->addAction(actionSave);
     toolBar->addAction(actionReloadLayout);
     toolBar->addWidget(configButton);
+    toolBar->addAction(actionSchedule);
+    toolBar->addAction(actionSchedulePrevious);
+    toolBar->addAction(actionScheduleApply);
+    toolBar->addAction(actionScheduleNext);
+    auto *toolbarSpacer = new QWidget(toolBar);
+    toolbarSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolBar->addWidget(toolbarSpacer);
+    toolBar->addAction(actionTimers);
+    toolBar->addAction(actionAnimations);
+    for (QAction *action : toolBar->actions())
+        if (auto *button = qobject_cast<QToolButton *>(toolBar->widgetForAction(action))) button->setMinimumHeight(32);
+    // Retain permanent controls when a different XML layout is loaded.
+    for (QAction *action : toolBar->actions()) action->setProperty("scPersistent", true);
     toolBar->addWidget(spaceLabel);
     toolBar->setContextMenuPolicy(Qt::PreventContextMenu);
 
@@ -464,6 +625,8 @@ void MainWindow::loadXML() {
             } else {
                 ((QCheckBox*)widgetList[i.key()])->setChecked(false);
             }
+        } else if (wType == "comboBox" && i.key().startsWith(QStringLiteral("stage-strike-")) && !currElement.isNull()) {
+            setComboValue(i.key(), currElement.text());
         } else if (wType == "radioGroup") {
             ((ScRadioGroup*)widgetList[i.key()])->checkFromValue(currElement.text());
         }
@@ -502,6 +665,8 @@ void MainWindow::loadJSON() {
             } else {
                 ((QCheckBox*)widgetList[i.key()])->setChecked(false);
             }
+        } else if (wType == "comboBox" && i.key().startsWith(QStringLiteral("stage-strike-")) && Obj.contains(i.key())) {
+            setComboValue(i.key(), Obj[i.key()].toString());
         } else if (wType == "radioGroup") {
             ((ScRadioGroup*)widgetList[i.key()])->checkFromValue(Obj[i.key()].toString());
         }
@@ -1297,6 +1462,8 @@ void MainWindow::loadLayout() {
     }
 
 
+    // Leave enough room for the permanent broadcast controls in narrow layouts.
+    layoutWidth = qMax(layoutWidth, 700);
     resize(layoutWidth, layoutHeight);
     setFixedSize(layoutWidth, layoutHeight);
 
@@ -1328,6 +1495,202 @@ void MainWindow::loadLayout() {
     if (!cliNode.isNull()) {
         parseCLI(cliNode);
     }
+
+    // Stage-striking catalog is independent of the layout and broadcast output.
+    // Games and their stage names are stored per layout. The normal Save button
+    // controls when the chosen stages and ban flags are published.
+    auto *stageGame = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-game")));
+    if (stageGame && stageGame->isEditable()) {
+        const QString scope = QString::fromLatin1(QCryptographicHash::hash(settings.value("layoutPath").toUtf8(), QCryptographicHash::Sha256).toHex());
+        const auto gamePrefix = [scope](const QString &name) {
+            return scope + QStringLiteral("/games/") + QString::fromLatin1(QCryptographicHash::hash(name.trimmed().toUtf8(), QCryptographicHash::Sha256).toHex());
+        };
+        QList<QComboBox *> stages;
+        for (int i=1; i<=9; ++i) {
+            auto *combo=qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-stage-%1").arg(i)));
+            if(combo && combo->isEditable()) stages.append(combo);
+        }
+        QSettings saved(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
+        const QStringList games=saved.value(scope+QStringLiteral("/gameNames")).toStringList();
+        for(const QString &name:games) if(stageGame->findText(name)<0) stageGame->addItem(name,name);
+        const QString last=saved.value(scope+QStringLiteral("/lastGame")).toString();
+        if(!last.isEmpty()) stageGame->setCurrentText(last);
+        const auto refreshStages = [stageGame, stages, gamePrefix] {
+            QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
+            const QString game=stageGame->currentText().trimmed();
+            const QString key=gamePrefix(game); const QStringList options=game.isEmpty()?QStringList():s.value(key+QStringLiteral("/stages")).toStringList();
+            for(int i=0;i<stages.size();++i) {
+                QComboBox *box=stages.at(i); QSignalBlocker blocked(box); box->clear(); box->addItem(QObject::tr("Select stage"), QString());
+                for(const QString &name:options) box->addItem(name,name);
+                const QString selected=game.isEmpty()?QString():s.value(key+QStringLiteral("/slot%1").arg(i+1)).toString();
+                const int idx=box->findText(selected); if(idx>=0 && !selected.isEmpty()) box->setCurrentIndex(idx); else if(!selected.isEmpty()) box->setEditText(selected); else box->setCurrentIndex(0);
+            }
+        };
+        const auto commitGame = [stageGame, scope, refreshStages] {
+            const QString name=stageGame->currentText().trimmed(); if(name.isEmpty()) return;
+            QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
+            QStringList games=s.value(scope+QStringLiteral("/gameNames")).toStringList();
+            if(!games.contains(name,Qt::CaseInsensitive)) { games.append(name); s.setValue(scope+QStringLiteral("/gameNames"),games); }
+            s.setValue(scope+QStringLiteral("/lastGame"),name);
+            if(stageGame->findText(name)<0) { QSignalBlocker blocked(stageGame);stageGame->addItem(name,name);stageGame->setCurrentText(name); }
+            refreshStages();
+        };
+        connect(stageGame, &QComboBox::currentTextChanged, stageGame, [refreshStages](const QString &) { refreshStages(); });
+        connect(stageGame, qOverload<int>(&QComboBox::activated), stageGame, [commitGame](int) { commitGame(); });
+        connect(stageGame->lineEdit(), &QLineEdit::editingFinished, stageGame, commitGame);
+        for(int i=0;i<stages.size();++i) {
+            QComboBox *box=stages.at(i);
+            const auto saveStage = [stageGame, box, stages, gamePrefix, i] {
+                const QString game=stageGame->currentText().trimmed();
+                QString value=box->currentText().trimmed();
+                if(box->currentIndex()==0 && value==QObject::tr("Select stage")) value.clear();
+                if(game.isEmpty()) return;
+                QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
+                const QString key=gamePrefix(game); QStringList options=s.value(key+QStringLiteral("/stages")).toStringList();
+                if(!value.isEmpty() && !options.contains(value,Qt::CaseInsensitive)) { options.append(value); s.setValue(key+QStringLiteral("/stages"), options); }
+                s.setValue(key+QStringLiteral("/slot%1").arg(i+1),value);
+                if(!value.isEmpty()) for(QComboBox *other:stages) if(other->findText(value)<0) { QSignalBlocker blocked(other); other->addItem(value,value); }
+            };
+            connect(box, qOverload<int>(&QComboBox::activated), box, [saveStage](int) { saveStage(); });
+            connect(box->lineEdit(), &QLineEdit::editingFinished, box, saveStage);
+        }
+        refreshStages();
+    }
+
+    // Optional team database: present only on layouts with the matching team widgets.
+    // The team CSV stores player names; details remain in the existing player dataset.
+    {
+        const QString teamPath=QFileInfo(settings.value("layoutPath")).dir().filePath(QStringLiteral("dataset-teams.csv"));
+        const auto teamField=[this](int team,const QString &field) -> ScLineEdit * {
+            return qobject_cast<ScLineEdit *>(widgetList.value(QStringLiteral("teams-team-%1-%2").arg(team).arg(field)));
+        };
+        const auto teamName=[teamField](int team) { return teamField(team,QStringLiteral("name")); };
+        auto *first=teamName(1); auto *second=teamName(2);
+        if(first && second && !settings.value("layoutPath").isEmpty()) {
+            QList<TeamRecord> initial; QString initialError;
+            TeamStore::read(teamPath,&initial,&initialError);
+            QStringList names; for(const TeamRecord &r:initial) names.append(r.name);
+            auto *firstCompleter=new QCompleter(names,first); auto *secondCompleter=new QCompleter(names,second);
+            for(auto *c : {firstCompleter,secondCompleter}) { c->setCaseSensitivity(Qt::CaseInsensitive); c->setFilterMode(Qt::MatchContains); c->setCompletionMode(QCompleter::PopupCompletion); }
+            first->setCompleter(firstCompleter); second->setCompleter(secondCompleter);
+            const auto refreshNames=[teamPath, firstCompleter,secondCompleter]() {
+                QList<TeamRecord> all;QString err;if(!TeamStore::read(teamPath,&all,&err))return;
+                QStringList choices;for(const TeamRecord &r:all)choices.append(r.name);
+                for(auto *c : {firstCompleter,secondCompleter}) {
+                    auto *model=qobject_cast<QStringListModel *>(c->model()); if(model)model->setStringList(choices);
+                }
+            };
+            const auto loadTeam=[this, teamPath,teamField,teamName](int team,const QString &requested) {
+                QList<TeamRecord> all;QString error;
+                if(!TeamStore::read(teamPath,&all,&error)) { QMessageBox::warning(this,tr("Team database"),tr("Could not read %1: %2").arg(teamPath,error));return; }
+                int found=-1; for(int i=0;i<all.size();++i)if(all.at(i).name.compare(requested.trimmed(),Qt::CaseInsensitive)==0){found=i;break;}
+                if(found<0){QMessageBox::information(this,tr("Team database"),tr("Team '%1' was not found in %2.").arg(requested,teamPath));return;}
+                const TeamRecord record=all.at(found);
+                auto *color=teamField(team,QStringLiteral("color")); if(!color)return;
+                // Resolve all widgets before changing any fields.
+                for(int i=1;i<=9;++i)if(!teamField(team,QStringLiteral("player-%1").arg(i)) || !teamField(team,QStringLiteral("player-%1-prefix").arg(i)) || !teamField(team,QStringLiteral("player-%1-pronouns").arg(i))) { QMessageBox::warning(this,tr("Team database"),tr("The Teams layout is missing player fields."));return; }
+                teamName(team)->setText(record.name);color->setText(record.color);
+                if(auto *shortName=teamField(team,QStringLiteral("short")))shortName->setText(record.shortName);
+                QStringList unmatched;
+                for(int i=1;i<=9;++i) {
+                    const QString base=QStringLiteral("teams-team-%1-player-%2").arg(team).arg(i);
+                    auto *name=qobject_cast<ScLineEdit *>(widgetList.value(base)); auto *prefix=qobject_cast<ScLineEdit *>(widgetList.value(base+"-prefix")); auto *pronouns=qobject_cast<ScLineEdit *>(widgetList.value(base+"-pronouns"));
+                    const QString player=record.players.value(i-1);name->setText(player);prefix->clear();pronouns->clear(); if(player.trimmed().isEmpty())continue;
+                    const QString playerSet=name->getDataSetName();
+                    if(playerSet.isEmpty() || prefix->getDataSetName()!=playerSet || pronouns->getDataSetName()!=playerSet){unmatched<<player;continue;}
+                    const QList<QStringList> data=dataSets.value(playerSet);
+                    const int nameCol=dataAssoc.value(base,-1), prefixCol=dataAssoc.value(base+"-prefix",-1), pronounCol=dataAssoc.value(base+"-pronouns",-1);
+                    if(nameCol<0||prefixCol<0||pronounCol<0||nameCol>=data.size()||prefixCol>=data.size()||pronounCol>=data.size()){unmatched<<player;continue;}
+                    const QStringList &playerNames=data.at(nameCol); int index=-1, matches=0;
+                    for(int j=0;j<playerNames.size();++j)if(playerNames.at(j).compare(player,Qt::CaseInsensitive)==0){index=j;++matches;}
+                    if(matches!=1||index>=data.at(prefixCol).size()||index>=data.at(pronounCol).size()){unmatched<<player;continue;}
+                    prefix->setText(data.at(prefixCol).at(index));pronouns->setText(data.at(pronounCol).at(index));
+                }
+                if(!unmatched.isEmpty())QMessageBox::warning(this,tr("Player lookup"),tr("These players were missing or duplicated in the player dataset. Their prefix and pronouns were left blank:\n%1").arg(unmatched.join("\n")));
+            };
+            const auto saveTeam=[this,teamPath,teamField,teamName,refreshNames](int team) {
+                auto *name=teamName(team); auto *color=teamField(team,QStringLiteral("color"));if(!name||!color)return;
+                auto *shortField=teamField(team,QStringLiteral("short"));
+                TeamRecord record;record.name=name->text().trimmed();record.color=color->text().trimmed();if(shortField)record.shortName=shortField->text().trimmed();
+                if(record.name.isEmpty()){QMessageBox::warning(this,tr("Team database"),tr("Enter a team name first."));return;}
+                if(!record.color.isEmpty()&&!QRegularExpression(QStringLiteral("^#[0-9a-fA-F]{6}$")).match(record.color).hasMatch()){QMessageBox::warning(this,tr("Team database"),tr("Use a team color in #RRGGBB format, or leave it blank."));return;}
+                for(int i=1;i<=9;++i){auto *player=teamField(team,QStringLiteral("player-%1").arg(i));if(!player){QMessageBox::warning(this,tr("Team database"),tr("The Teams layout is missing player fields."));return;}record.players.append(player->text().trimmed());}
+                QList<TeamRecord> all;QString error;if(!TeamStore::read(teamPath,&all,&error)){QMessageBox::warning(this,tr("Team database"),tr("Could not read %1: %2. Nothing was saved.").arg(teamPath,error));return;}
+                int index=-1;for(int i=0;i<all.size();++i)if(all.at(i).name.compare(record.name,Qt::CaseInsensitive)==0){index=i;break;}
+                if(index>=0){const TeamRecord old=all.at(index);if(!shortField)record.shortName=old.shortName;if(old.name==record.name && old.color==record.color && old.shortName==record.shortName && old.players==record.players){QMessageBox::information(this,tr("Team database"),tr("This team already matches the saved record."));return;}
+                    const QString comparison=tr("Replace the existing team?\n\nSaved short name: %1\nNew short name: %2\n\nSaved color: %3\nNew color: %4\n\nSaved players:\n%5\n\nNew players:\n%6").arg(old.shortName,record.shortName,old.color,record.color,old.players.join("\n"),record.players.join("\n"));
+                    if(QMessageBox::question(this,tr("Update team"),comparison,QMessageBox::Yes|QMessageBox::No,QMessageBox::No)!=QMessageBox::Yes)return;all[index]=record;
+                }else all.append(record);
+                if(!TeamStore::write(teamPath,all,&error)){QMessageBox::warning(this,tr("Team database"),tr("Could not save %1: %2").arg(teamPath,error));return;}
+                refreshNames();QMessageBox::information(this,tr("Team database"),tr("Saved '%1' to %2.").arg(record.name,teamPath));
+            };
+            const auto deleteTeam=[this,teamPath,teamName,refreshNames](int team) {
+                auto *nameField=teamName(team);
+                if(!nameField) return;
+                const QString requested=nameField->text().trimmed();
+                if(requested.isEmpty()){QMessageBox::warning(this,tr("Team database"),tr("Enter the name of the saved team to delete."));return;}
+                QList<TeamRecord> all; QString error;
+                if(!TeamStore::read(teamPath,&all,&error)){QMessageBox::warning(this,tr("Team database"),tr("Could not read %1: %2").arg(teamPath,error));return;}
+                int index=-1;for(int i=0;i<all.size();++i)if(all.at(i).name.compare(requested,Qt::CaseInsensitive)==0){index=i;break;}
+                if(index<0){QMessageBox::information(this,tr("Team database"),tr("Team '%1' was not found.").arg(requested));return;}
+                const TeamRecord selected=all.at(index);
+                const QString savedName=selected.name;
+                if(QMessageBox::question(this,tr("Delete saved team"),tr("Delete '%1' from the team database? The player database and current dashboard fields will remain unchanged.").arg(savedName),QMessageBox::Yes|QMessageBox::No,QMessageBox::No)!=QMessageBox::Yes)return;
+                if(!TeamStore::read(teamPath,&all,&error)){QMessageBox::warning(this,tr("Team database"),tr("Could not re-read %1: %2").arg(teamPath,error));return;}
+                index=-1;for(int i=0;i<all.size();++i)if(all.at(i).name.compare(savedName,Qt::CaseInsensitive)==0){index=i;break;}
+                if(index<0 || all.at(index).name!=selected.name || all.at(index).color!=selected.color || all.at(index).shortName!=selected.shortName || all.at(index).players!=selected.players){QMessageBox::warning(this,tr("Team database"),tr("The saved team changed while the confirmation was open. Nothing was deleted."));return;}
+                all.removeAt(index);
+                if(!TeamStore::write(teamPath,all,&error)){QMessageBox::warning(this,tr("Team database"),tr("Could not delete team from %1: %2").arg(teamPath,error));return;}
+                refreshNames();QMessageBox::information(this,tr("Team database"),tr("Deleted '%1' from the team database.").arg(savedName));
+            };
+            for(int team=1;team<=2;++team){
+                auto *load=qobject_cast<QPushButton *>(visualList.value(QStringLiteral("teams-load-%1").arg(team)));
+                auto *save=qobject_cast<QPushButton *>(visualList.value(QStringLiteral("teams-save-%1").arg(team)));
+                if(load)connect(load,&QPushButton::clicked,load,[loadTeam,team,teamName]{loadTeam(team,teamName(team)->text());});
+                if(save)connect(save,&QPushButton::clicked,save,[saveTeam,team]{saveTeam(team);});
+                auto *del=qobject_cast<QPushButton *>(visualList.value(QStringLiteral("teams-delete-%1").arg(team)));
+                if(del)connect(del,&QPushButton::clicked,del,[deleteTeam,team]{deleteTeam(team);});
+                QCompleter *c=team==1?firstCompleter:secondCompleter;
+                connect(c,qOverload<const QString &>(&QCompleter::activated),teamName(team),[loadTeam,team](const QString &text){loadTeam(team,text);});
+            }
+        }
+    }
+
+    // Wire conditional choices only after every layout widget exists.
+    QList<std::function<void()>> conditionalRefreshes;
+    for (auto it = widgetType.cbegin(); it != widgetType.cend(); ++it) {
+        if (it.value() != "comboBox") continue;
+        auto *dependent = qobject_cast<ScComboBox *>(widgetList.value(it.key()));
+        if (!dependent) continue;
+        const QString sourceId = dependent->property("scDependsOn").toString();
+        if (sourceId.isEmpty() || widgetType.value(sourceId) != "comboBox") continue;
+        // Ignore cycles rather than recursively emitting selection changes.
+        QSet<QString> seen; QString walk = it.key(); bool cycle = false;
+        while (!walk.isEmpty()) {
+            if (seen.contains(walk)) { cycle = true; break; }
+            seen.insert(walk);
+            auto *node = qobject_cast<ScComboBox *>(widgetList.value(walk));
+            walk = node ? node->property("scDependsOn").toString() : QString();
+        }
+        if (cycle) continue;
+        auto *source = qobject_cast<ScComboBox *>(widgetList.value(sourceId));
+        if (!source) continue;
+        const auto update = [source, dependent] {
+            const QString selected = dependent->currentData().toString();
+            const QString parentValue = source->currentData().isValid() ? source->currentData().toString() : source->currentText();
+            const QVariantList entries = dependent->property("scConditionalItems").toList();
+            dependent->clear();
+            for (const QVariant &entry : entries) {
+                const QVariantMap item = entry.toMap(); const QString when = item.value("when").toString();
+                if (when.isEmpty() || when == parentValue) dependent->addItem(item.value("text").toString(), item.value("value"));
+            }
+            const int restored = dependent->findData(selected);
+            if (restored >= 0) dependent->setCurrentIndex(restored);
+        };
+        connect(source, qOverload<int>(&QComboBox::currentIndexChanged), dependent, [update](int) { update(); });
+        conditionalRefreshes.append(update);
+    }
+    for (const auto &update : conditionalRefreshes) update();
 
     //connect signal mappers
 
@@ -1376,10 +1739,16 @@ void MainWindow::parseLayout(QDomElement element, QWidget *parent) {
             addRadioGroup(child.toElement(), parent);
         } else if (tagName == "comboBox") {
             addComboBox(child.toElement(), parent);
+        } else if (tagName == "bracketImporter") {
+            const QDomElement e = child.toElement();
+            auto *panel = new BracketImportDialog(parent);
+            panel->setWindowFlags(Qt::Widget);
+            panel->setObjectName(QStringLiteral("bracket-import-panel"));
+            panel->setGeometry(e.attribute("x", "0").toInt(), e.attribute("y", "0").toInt(),
+                               e.attribute("width", "1180").toInt(), e.attribute("height", "600").toInt());
+            panel->show();
         } else if (tagName == "tweet") {
             addTweetWidget(child.toElement(), parent);
-        } else if (tagName == "challonge") {
-            addProviderWidget(child.toElement(), parent, widgetList, ProviderWidgetBuilder::Provider::Challonge);
         } else if (tagName == "smashgg") {
             addProviderWidget(child.toElement(), parent, widgetList, ProviderWidgetBuilder::Provider::Smashgg);
         } else if (tagName == "tabSet") {
@@ -1694,6 +2063,56 @@ void MainWindow::addLabel(QDomElement element, QWidget *parent) {
                                                           element.attribute("height").toInt()));
     setWidgetFontSize(visualList[newLabel], element.attribute("fontSize", 0).toInt());
     ((QLabel*)visualList[newLabel])->setText(element.text());
+    const QString alignment = element.attribute("align").trimmed().toLower();
+    if (alignment == "left") ((QLabel*)visualList[newLabel])->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    else if (alignment == "center") ((QLabel*)visualList[newLabel])->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+    else if (alignment == "right") ((QLabel*)visualList[newLabel])->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    // Optional read-only mirror of a scalar value in a local JSON file.
+    // @schedule follows the schedule dialog's saved output location.
+    const QString mirrorFile = element.attribute("mirrorFile").trimmed();
+    const QString mirrorPath = element.attribute("mirrorPath").trimmed();
+    if (!mirrorFile.isEmpty() && !mirrorPath.isEmpty()) {
+        QLabel *label = static_cast<QLabel *>(visualList[newLabel]);
+        const QString fallback = element.text();
+        auto *timer = new QTimer(label);
+        timer->setInterval(1000);
+        const auto updateMirror = [this, label, mirrorFile, mirrorPath, fallback] {
+            QString path = mirrorFile;
+            if (path == QStringLiteral("@schedule")) {
+                QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("Schedule"));
+                path = settings.value(QStringLiteral("outputPath")).toString();
+            } else if (path == QStringLiteral("@bingo")) {
+                QSettings bingoSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("BingoScores"));
+                path = bingoSettings.value(QStringLiteral("outputPath")).toString();
+            } else if (QFileInfo(path).isRelative()) {
+                path = QFileInfo(settings.value("layoutPath")).dir().filePath(path);
+            }
+            QFile file(path);
+            if (path.isEmpty() || !file.open(QIODevice::ReadOnly) || file.size() > 2 * 1024 * 1024) { label->setText(fallback); return; }
+            QJsonParseError error;
+            const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &error);
+            if (error.error != QJsonParseError::NoError) { label->setText(fallback); return; }
+            QJsonValue value;
+            if (doc.isObject()) value = QJsonValue(doc.object());
+            else if (doc.isArray()) value = QJsonValue(doc.array());
+            else { label->setText(fallback); return; }
+            for (const QString &part : mirrorPath.split(QLatin1Char('.'))) {
+                if (value.isObject()) value = value.toObject().value(part);
+                else if (value.isArray()) {
+                    bool ok = false; int index = part.toInt(&ok);
+                    const QJsonArray array = value.toArray();
+                    value = ok && index >= 0 && index < array.size() ? array.at(index) : QJsonValue();
+                } else { value = QJsonValue(); break; }
+            }
+            if (value.isString()) label->setText(value.toString());
+            else if (value.isDouble()) label->setText(QString::number(value.toDouble(), 'g', 15));
+            else if (value.isBool()) label->setText(value.toBool() ? QStringLiteral("true") : QStringLiteral("false"));
+            else label->setText(fallback);
+        };
+        connect(timer, &QTimer::timeout, label, updateMirror);
+        updateMirror(); timer->start();
+    }
 
     layoutIterator++;
 }
@@ -1868,6 +2287,17 @@ void MainWindow::addComboBox(QDomElement element, QWidget *parent) {
 
     }
 
+    QVariantList conditionalItems;
+    const QString dependsOn = element.attribute("dependsOn").trimmed();
+    if (!dependsOn.isEmpty() && !element.hasAttribute("dataSet")) {
+        ((ScComboBox*)widgetList[newComboBox])->setProperty("scDependsOn", dependsOn);
+        for (QDomElement item = element.firstChildElement("comboItem"); !item.isNull(); item = item.nextSiblingElement("comboItem")) {
+            QVariantMap entry; entry.insert("text", item.text());
+            entry.insert("value", item.hasAttribute("value") ? item.attribute("value") : item.text());
+            entry.insert("when", item.attribute("when")); conditionalItems.append(entry);
+        }
+        ((ScComboBox*)widgetList[newComboBox])->setProperty("scConditionalItems", conditionalItems);
+    }
     QDomNode child = element.firstChildElement();
     int selectedIndex = 0;
     for (int itemIndex = 0; !child.isNull(); itemIndex++) {
@@ -1993,7 +2423,14 @@ void MainWindow::addRadioGroup(QDomElement element, QWidget *parent) {
 }
 
 void MainWindow::addButton(QDomElement element, QWidget *parent) {
-    if (element.attribute("type") == "reset") {
+    if (element.attribute("type") == "teamLoad" || element.attribute("type") == "teamSave" || element.attribute("type") == "teamDelete") {
+        const QString id=element.attribute("id");
+        auto *button=new QPushButton(element.text(),parent);
+        button->setObjectName(id);
+        button->setGeometry(QRect(element.attribute("x").toInt(),element.attribute("y").toInt(),element.attribute("width").toInt(),element.attribute("height").toInt()));
+        setWidgetFontSize(button,element.attribute("fontSize",0).toInt());
+        visualList[id]=button; widgetType[id]=element.attribute("type");
+    } else if (element.attribute("type") == "reset") {
         QString newButton = element.attribute("id");
 
         QList<QString> resetL = CSV::parseFromString(element.attribute("reset"))[0];
@@ -2003,6 +2440,7 @@ void MainWindow::addButton(QDomElement element, QWidget *parent) {
         resetList.insert(newButton,resetL);
 
         visualList[newButton] = new QPushButton(parent);
+        visualList[newButton]->setProperty("scButtonRole", "reset");
         visualList[newButton]->setObjectName(newButton);
         visualList[newButton]->setGeometry(QRect(element.attribute("x").toInt(),
                                            element.attribute("y").toInt(),
@@ -2041,6 +2479,7 @@ void MainWindow::addButton(QDomElement element, QWidget *parent) {
         widgetType[newButton] = "swapButton";
 
         visualList[newButton] = new QPushButton(parent);
+        visualList[newButton]->setProperty("scButtonRole", "swap");
         visualList[newButton]->setObjectName(newButton);
         visualList[newButton]->setGeometry(QRect(element.attribute("x").toInt(),
                                                  element.attribute("y").toInt(),
@@ -2086,6 +2525,30 @@ void MainWindow::addButton(QDomElement element, QWidget *parent) {
         if(!element.attribute("hotkey").isEmpty()) {
             addHotkey(element.attribute("hotkey"),newButton,"Timestamp");
         }
+    } else if (element.attribute("type") == "scoreStep") {
+        const QString buttonId = element.attribute("id");
+        const QString target = element.attribute("target");
+        const int step = element.attribute("step").toInt();
+        auto *button = new QPushButton(element.text(), parent);
+        button->setObjectName(buttonId);
+        button->setGeometry(QRect(element.attribute("x").toInt(), element.attribute("y").toInt(), element.attribute("width").toInt(), element.attribute("height").toInt()));
+        setWidgetFontSize(button, element.attribute("fontSize", 0).toInt());
+        button->setProperty("scoreTarget", target); button->setProperty("scoreStep", step);
+        visualList[buttonId] = button; widgetType[buttonId] = "scoreStep";
+        connect(button, &QPushButton::clicked, this, [this, button, target, step] {
+            button->setProperty("scorePublishError",QString());
+            if (widgetType.value(target) != "spinBox") {button->setProperty("scorePublishError",tr("Invalid score target."));return;}
+            auto *score = qobject_cast<QSpinBox *>(widgetList.value(target));
+            if (!score) {button->setProperty("scorePublishError",tr("Score control is unavailable."));return;}
+            const int previous=score->value();
+            if (step > 0) score->stepUp(); else score->stepDown();
+            if(score->value()==previous)return;
+            QString error;
+            if(!publishScoreOnly(settings.value("outputPath"),saveFormat,target,score->value(),wsServer,&error)){
+                button->setProperty("scorePublishError",error);
+                statusBar()->showMessage(tr("Score not published: %1").arg(error),15000);
+            }
+        });
     } else if (element.attribute("type") == "setButton") {
         bool nSaveOnClick = false;
         if (element.attribute("saveonclick") == "true" || element.attribute("saveonclick") == "1") {
@@ -2220,6 +2683,12 @@ QString MainWindow::applyRemoteAction(const QJsonObject &action) {
             tsClick(id);
         } else if (wType == "setButton") {
             setButtonClick(id);
+        } else if (wType == "scoreStep") {
+            auto *button = qobject_cast<QPushButton *>(visualList.value(id));
+            if (!button || widgetType.value(button->property("scoreTarget").toString()) != "spinBox") return "invalid score target for '" + id + "'";
+            button->click();
+            const QString publishError=button->property("scorePublishError").toString();
+            if(!publishError.isEmpty())return publishError;
         } else {
             return "'" + id + "' is not a button";
         }
@@ -2293,6 +2762,10 @@ void MainWindow::addLineEdit(QDomElement element, QWidget *parent) {
                                              element.attribute("width").toInt(),
                                              element.attribute("height").toInt()));
     setWidgetFontSize((ScLineEdit*)widgetList[newLineEdit], element.attribute("fontSize", 0).toInt());
+    const QString alignment = element.attribute("align").trimmed().toLower();
+    if (alignment == "left") ((ScLineEdit*)widgetList[newLineEdit])->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    else if (alignment == "center") ((ScLineEdit*)widgetList[newLineEdit])->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+    else if (alignment == "right") ((ScLineEdit*)widgetList[newLineEdit])->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     widgetType[newLineEdit] = "lineEdit";
 
     if (element.text() != "") {
@@ -2549,6 +3022,32 @@ QList<QStringList> MainWindow::condenseDataSet(QList<QStringList> oldSet) {
 }
 
 void MainWindow::saveDataSets() {
+    // Validate master/slave dataset links before changing any dataset in memory.
+    // A mismatched file can otherwise index a different dataset's columns.
+    for(auto it=dataMaster.cbegin();it!=dataMaster.cend();++it) {
+        ScCompleter *master=completerList.value(it.key(),nullptr);
+        if(!master){QMessageBox::warning(this,tr("Dataset configuration"),tr("Player dataset master '%1' is missing. Dashboard output was saved, but datasets were not saved.").arg(it.key()));return;}
+        const QString masterSet=master->getDataSetName();
+        for(const QString &slaveName:it.value()) {
+            ScCompleter *slave=completerList.value(slaveName,nullptr);
+            if(!slave || slave->getDataSetName()!=masterSet){
+                QMessageBox::warning(this,tr("Dataset configuration"),tr("Field '%1' and its master '%2' must use the same dataset. Dashboard output was saved, but datasets were not saved.").arg(slaveName,it.key()));return;
+            }
+        }
+    }
+    for(auto it=dataSets.cbegin();it!=dataSets.cend();++it) {
+        if(it.value().isEmpty())continue;
+        const qsizetype rows=it.value().first().size();
+        for(const QStringList &column:it.value())if(column.size()!=rows){
+            QMessageBox::warning(this,tr("Dataset configuration"),tr("Dataset '%1' has columns with different numbers of entries. Dashboard output was saved, but datasets were not saved. Check the CSV before retrying.").arg(it.key()));return;
+        }
+    }
+    for(auto it=completerList.cbegin();it!=completerList.cend();++it) {
+        ScCompleter *completer=it.value();
+        if(!completer || !widgetList.value(it.key()) || !dataSets.contains(completer->getDataSetName()) || completer->getDataField()<0 || completer->getDataField()>=dataSets.value(completer->getDataSetName()).size()){
+            QMessageBox::warning(this,tr("Dataset configuration"),tr("Field '%1' has an invalid dataset column. Dashboard output was saved, but datasets were not saved.").arg(it.key()));return;
+        }
+    }
     QMapIterator<QString, ScCompleter *> i(completerList);
     QStringList updatedSets;
     while (i.hasNext()) {
@@ -2767,8 +3266,8 @@ QDomDocument MainWindow::getDefaultLayout() {
 void MainWindow::clearMaps() {
     QList<QAction *> tbList = toolBar->actions();
 
-    for (int tbi = 3; tbi < tbList.length();tbi++) {
-        toolBar->removeAction(tbList.at(tbi));
+    for (QAction *action : tbList) {
+        if (!action->property("scPersistent").toBool()) toolBar->removeAction(action);
     }
 
     widgetList.clear();

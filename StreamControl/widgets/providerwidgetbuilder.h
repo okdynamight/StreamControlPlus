@@ -39,8 +39,7 @@ class ProviderWidgetBuilder
 public:
     enum class Provider
     {
-        Smashgg,
-        Challonge
+        Smashgg
     };
 
     ProviderWidgetBuilder(QWidget *parent, QMap<QString, QObject*>& widgetList,

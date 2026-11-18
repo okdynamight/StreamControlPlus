@@ -35,7 +35,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QString>
 
 class SmashggTab;
-class BracketTab;
+class QLineEdit;
 
 class WidgetSettingsDialog : public QDialog
 {
@@ -53,9 +53,10 @@ public slots:
 private:
 
     QMap<QString, QString> settings;
+    QMap<QString, QLineEdit *> futureServiceFields;
 
+    QLineEdit *bracketStartKey, *bracketParryKey, *lockoutToken;
     SmashggTab* smashggTab;
-    BracketTab* bracketTab;
 
     QTabWidget *tabWidget;
     QDialogButtonBox *buttonBox;

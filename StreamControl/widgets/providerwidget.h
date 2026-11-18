@@ -85,7 +85,7 @@ protected:
     // Used to save bracket data to a file when the button is pressed
     QJsonDocument currentTournamentJson;
 
-    // Needed to get the challonge/smash.gg user data and the outputPath
+    // Needed to get the tournament provider settings and the outputPath
     const QMap<QString, QString>& settings;
 
     void fillMatchWidgets(QString playerOne, QString playerTwo,
@@ -96,11 +96,11 @@ protected:
                                 QString playerOne, QString playerTwo,
                                 QString scoreOne, QString scoreTwo);
 
-    // Saves challonge bracket data to a file in json format
+    // Saves bracket data to a file in json format
     // Returns false if outputFileName is empty
     bool writeBracketToFile();
 
-    // Clears all challonge associated widgets specified in the layout file
+    // Clears provider-associated widgets specified in the layout file
     void clearBracketWidgets();
 private:
     QGridLayout     *layout;

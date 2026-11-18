@@ -1,4 +1,6 @@
 #include "broadcastcontrol.h"
+#include "twitchbroadcastdialog.h"
+#include "twitchpointsdialog.h"
 
 #include <QDateTime>
 #include <QFileDialog>
@@ -9,6 +11,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QSettings>
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -17,7 +20,9 @@
 
 BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
 {
-    setWindowTitle(tr("Broadcast timers and animations"));
+    setWindowTitle(tr("Broadcast timers"));
+    QSettings saved(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
+    outputPath = saved.value("outputPath").toString();
     resize(480, 250);
     auto *layout = new QVBoxLayout(this);
     auto *duration = new QHBoxLayout;
@@ -45,12 +50,29 @@ BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
     runControls->addWidget(runStartButton); runControls->addWidget(runPauseButton);
     runControls->addWidget(runStopButton); runControls->addWidget(runResetButton);
     layout->addLayout(runControls);
-    auto *triggers = new QHBoxLayout;
-    animationOne = new QPushButton(this); animationTwo = new QPushButton(this);
-    triggers->addWidget(animationOne); triggers->addWidget(animationTwo); layout->addLayout(triggers);
     auto *destination = new QPushButton(tr("Choose output JSON…"), this); layout->addWidget(destination);
     outputLabel = new QLabel(this); outputLabel->setWordWrap(true); layout->addWidget(outputLabel);
     statusLabel = new QLabel(this); statusLabel->setWordWrap(true); layout->addWidget(statusLabel);
+
+    animationDialog = new QDialog(parent);
+    animationDialog->setWindowTitle(tr("Broadcast Control"));
+    auto *animationLayout = new QVBoxLayout(animationDialog);
+    auto *triggers = new QHBoxLayout;
+    animationOne = new QPushButton(animationDialog); animationTwo = new QPushButton(animationDialog);
+    animationThree = new QPushButton(animationDialog); animationFour = new QPushButton(animationDialog);
+    triggers->addWidget(animationOne); triggers->addWidget(animationTwo); triggers->addWidget(animationThree); triggers->addWidget(animationFour); animationLayout->addLayout(triggers);
+    auto *animationDestination = new QPushButton(tr("Choose shared output JSON…"), animationDialog);
+    animationLayout->addWidget(animationDestination);
+    animationOutputLabel = new QLabel(animationDialog); animationOutputLabel->setWordWrap(true); animationLayout->addWidget(animationOutputLabel);
+    animationStatusLabel = new QLabel(animationDialog); animationStatusLabel->setWordWrap(true); animationLayout->addWidget(animationStatusLabel);
+    auto *twitchControls = new TwitchBroadcastDialog(animationDialog);
+    twitchControls->setWindowFlags(Qt::Widget);
+    animationLayout->addWidget(twitchControls);
+    auto *points = new TwitchPointsDialog(animationDialog);
+    auto *pointsButton = new QPushButton(tr("Open subscription points…"), animationDialog);
+    animationLayout->addWidget(pointsButton);
+    connect(pointsButton, &QPushButton::clicked, points, &QDialog::show);
+    connect(animationDestination, &QPushButton::clicked, this, [this] { chooseOutput(); });
     ticker = new QTimer(this); ticker->setInterval(250);
     connect(ticker, &QTimer::timeout, this, [this] { tick(); });
     connect(destination, &QPushButton::clicked, this, [this] { chooseOutput(); });
@@ -63,6 +85,11 @@ BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
     connect(runStopButton, &QPushButton::clicked, this, [this] { stopRun(); });
     connect(runResetButton, &QPushButton::clicked, this, [this] { resetRun(); });
     const auto durationChanged = [this](int) { if (state == "idle") reset(); };
+    hours->setValue(saved.value("hours", 0).toInt()); minutes->setValue(saved.value("minutes", 0).toInt()); seconds->setValue(saved.value("seconds", 0).toInt());
+    const auto saveDuration = [this](int) { QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls")); settings.setValue("hours", hours->value()); settings.setValue("minutes", minutes->value()); settings.setValue("seconds", seconds->value()); };
+    connect(hours, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
+    connect(minutes, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
+    connect(seconds, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
     connect(hours, qOverload<int>(&QSpinBox::valueChanged), this, durationChanged);
     connect(minutes, qOverload<int>(&QSpinBox::valueChanged), this, durationChanged);
     connect(seconds, qOverload<int>(&QSpinBox::valueChanged), this, durationChanged);
@@ -74,7 +101,22 @@ BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
         triggerTwo = !triggerTwo; revisionTwo = revisionTwo == INT_MAX ? 0 : revisionTwo + 1;
         updateDisplay(); publish();
     });
+    connect(animationThree, &QPushButton::clicked, this, [this] { triggerThree = !triggerThree; revisionThree = revisionThree == INT_MAX ? 0 : revisionThree + 1; updateDisplay(); publish(); });
+    connect(animationFour, &QPushButton::clicked, this, [this] { triggerFour = !triggerFour; revisionFour = revisionFour == INT_MAX ? 0 : revisionFour + 1; updateDisplay(); publish(); });
     updateDisplay();
+}
+
+void BroadcastControl::showAnimations()
+{
+    animationDialog->show();
+    animationDialog->raise();
+    animationDialog->activateWindow();
+}
+
+void BroadcastControl::setStatus(const QString &message)
+{
+    statusLabel->setText(message);
+    animationStatusLabel->setText(message);
 }
 
 qint64 BroadcastControl::currentRemaining() const
@@ -132,9 +174,11 @@ void BroadcastControl::chooseOutput()
     const QString name = QFileInfo(path).fileName();
     if (name.compare("streamcontrol.json", Qt::CaseInsensitive) == 0 ||
         name.compare("schedule.json", Qt::CaseInsensitive) == 0) {
-        statusLabel->setText(tr("Choose a separate file from the existing overlay and schedule outputs.")); return;
+        setStatus(tr("Choose a separate file from the existing overlay and schedule outputs.")); return;
     }
     outputPath = path;
+    QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
+    settings.setValue("outputPath", outputPath);
     updateDisplay(); publish();
 }
 
@@ -143,7 +187,7 @@ void BroadcastControl::startOrResume()
     if (state == "running") return;
     if (state != "paused") {
         remainingAtStart = (qint64(hours->value()) * 3600 + minutes->value() * 60 + seconds->value()) * 1000;
-        if (remainingAtStart <= 0) { statusLabel->setText(tr("Enter a duration greater than zero.")); return; }
+        if (remainingAtStart <= 0) { setStatus(tr("Enter a duration greater than zero.")); return; }
     }
     elapsed.start(); state = QStringLiteral("running"); updateTicker();
     updateDisplay(); publish();
@@ -195,8 +239,10 @@ void BroadcastControl::updateDisplay()
     runStartButton->setEnabled(runState != "running");
     runPauseButton->setEnabled(runState == "running");
     runStopButton->setEnabled(runState == "running" || runState == "paused");
-    animationOne->setText(tr("Animation 1: %1").arg(triggerOne ? "ON" : "OFF"));
-    animationTwo->setText(tr("Animation 2: %1").arg(triggerTwo ? "ON" : "OFF"));
+    animationOne->setText(tr("Toggle casters: %1").arg(triggerOne ? "ON" : "OFF"));
+    animationTwo->setText(tr("Toggle talent: %1").arg(triggerTwo ? "ON" : "OFF"));
+    animationThree->setText(tr("Toggle lower 3rd: %1").arg(triggerThree ? "ON" : "OFF"));
+    animationFour->setText(tr("Toggle score: %1").arg(triggerFour ? "ON" : "OFF"));
     startButton->setText(state == "paused" ? tr("Resume") : tr("Start"));
     startButton->setEnabled(state != "running");
     pauseButton->setEnabled(state == "running");
@@ -204,11 +250,12 @@ void BroadcastControl::updateDisplay()
     const bool editable = state != "running" && state != "paused";
     hours->setEnabled(editable); minutes->setEnabled(editable); seconds->setEnabled(editable);
     outputLabel->setText(outputPath.isEmpty() ? tr("No output file selected") : tr("Output: %1").arg(outputPath));
+    animationOutputLabel->setText(outputLabel->text());
 }
 
 void BroadcastControl::publish()
 {
-    if (outputPath.isEmpty()) { statusLabel->setText(tr("Choose an output file to publish controls.")); return; }
+    if (outputPath.isEmpty()) { setStatus(tr("Choose an output file to publish controls.")); return; }
     QJsonObject timer;
     timer.insert("state", state);
     timer.insert("remaining_ms", double(currentRemaining()));
@@ -219,12 +266,14 @@ void BroadcastControl::publish()
     runTimer.insert("updated_at", timer.value("updated_at"));
     QJsonObject first; first.insert("value", triggerOne); first.insert("revision", revisionOne);
     QJsonObject second; second.insert("value", triggerTwo); second.insert("revision", revisionTwo);
-    QJsonObject animations; animations.insert("animation_1", first); animations.insert("animation_2", second);
+    QJsonObject third; third.insert("value", triggerThree); third.insert("revision", revisionThree);
+    QJsonObject fourth; fourth.insert("value", triggerFour); fourth.insert("revision", revisionFour);
+    QJsonObject animations; animations.insert("animation_1", first); animations.insert("animation_2", second); animations.insert("animation_3", third); animations.insert("animation_4", fourth);
     QJsonObject root; root.insert("version", 1); root.insert("timer", timer); root.insert("run_timer", runTimer); root.insert("animations", animations);
     QSaveFile file(outputPath);
-    if (!file.open(QIODevice::WriteOnly)) { statusLabel->setText(tr("Output failed: %1").arg(file.errorString())); return; }
+    if (!file.open(QIODevice::WriteOnly)) { setStatus(tr("Output failed: %1").arg(file.errorString())); return; }
     const QByteArray data = QJsonDocument(root).toJson(QJsonDocument::Compact);
-    if (file.write(data) != data.size()) { statusLabel->setText(tr("Output failed: %1").arg(file.errorString())); file.cancelWriting(); return; }
-    if (!file.commit()) { statusLabel->setText(tr("Output failed: %1").arg(file.errorString())); return; }
-    statusLabel->setText(tr("Controls published."));
+    if (file.write(data) != data.size()) { setStatus(tr("Output failed: %1").arg(file.errorString())); file.cancelWriting(); return; }
+    if (!file.commit()) { setStatus(tr("Output failed: %1").arg(file.errorString())); return; }
+    setStatus(tr("Controls published."));
 }

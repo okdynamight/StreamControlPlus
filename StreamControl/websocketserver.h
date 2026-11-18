@@ -21,6 +21,7 @@ public:
 
     void broadcast(const QString &message);
     void setLastMessage(const QString &message);
+    QString lastMessage() const { return m_lastMessage; }
 
     // Control auth: secret = base64(sha256(password + salt)), with a fresh salt per password.
     // Control is off when disabled or the password is empty.

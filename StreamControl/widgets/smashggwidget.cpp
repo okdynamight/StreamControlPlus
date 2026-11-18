@@ -1,3 +1,4 @@
+#include "../integrationnetwork.h"
 /**********************************************************************************
 
 Copyright (c) 2015, Antony Clarke
@@ -58,7 +59,7 @@ SmashggWidget::SmashggWidget(QWidget *parent,
                    bracketWidgetId, outputFileName, bracketWidgets,
                    clearWidgets, "or Tournament Slug:")
 {
-    manager = new QNetworkAccessManager;
+    manager = new QNetworkAccessManager(this);
 };
 
 void SmashggWidget::fetchTournaments()
@@ -70,10 +71,12 @@ void SmashggWidget::fetchTournaments()
     };
 
     QNetworkRequest request(urlString);
+    IntegrationNetwork::configure(request);
     QString data = smashggRequest(request, tourneysRequest, variables);
 
     QNetworkReply *reply = manager->post(request, data.toLocal8Bit());
 
+    connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
     connect(reply, SIGNAL(finished()), this, SLOT(processTournamentListJson()));
 }
 
@@ -93,10 +96,12 @@ void SmashggWidget::fetchMatches()
     };
 
     QNetworkRequest request(urlString);
+    IntegrationNetwork::configure(request);
 
     QString data = smashggRequest(request, streamQueueBySlugRequest, variables);
     QNetworkReply *reply = manager->post(request, data.toLocal8Bit());
 
+    connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
     connect(reply, SIGNAL(finished()), this, SLOT(processTournamentJson()));
 }
 
@@ -128,23 +133,8 @@ void SmashggWidget::processTournamentListJson()
 
     if (reply->error() != QNetworkReply::NoError)
     {
-        if (response.isEmpty())
-        {
-            statusLabel->setText(labelText.arg(replyData));
-        }
-        else
-        {
-            const QJsonArray errorList = response.object()["errors"].toArray();
-
-            QStringList errors;
-            for (QJsonArray::const_iterator iter = errorList.constBegin();
-                 iter != errorList.constEnd(); iter++)
-            {
-                errors.append(iter->toString());
-            }
-
-            statusLabel->setText(labelText.arg(errors.join("\n")));
-        }
+        statusLabel->setText(QStringLiteral("Error loading tournament list:\n%1").arg(
+            IntegrationNetwork::errorMessage(reply, replyData.toUtf8())));
         return;
     }
 
@@ -185,24 +175,8 @@ void SmashggWidget::processTournamentJson()
 
     if (reply->error() != QNetworkReply::NoError)
     {
-        QString labelText = "Error loading tournament data:\n%1";
-
-        QJsonDocument errorJson = QJsonDocument::fromJson(replyData.toUtf8());
-
-        qDebug() << replyData;
-
-
-        const QJsonArray errorList = errorJson.object()["errors"].toArray();
-
-        QStringList errors;
-        for (QJsonArray::const_iterator iter = errorList.constBegin();
-             iter != errorList.constEnd(); iter++)
-        {
-            errors.append(iter->toString());
-        }
-
-        statusLabel->setText(labelText.arg(errors.join("\n")));
-
+        statusLabel->setText(QStringLiteral("Error loading tournament data:\n%1").arg(
+            IntegrationNetwork::errorMessage(reply, replyData.toUtf8())));
         return;
     }
 

@@ -27,9 +27,15 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <QVBoxLayout>
 #include <QLineEdit>
+#include <QFormLayout>
+#include <QLabel>
+#include <QList>
+#include <QPair>
+#include <QPushButton>
+#include <QSettings>
+#include "twitchpointsdialog.h"
 
 #include "smashggtab.h"
-#include "brackettab.h"
 #include "widgetsettingsdialog.h"
 
 
@@ -38,9 +44,50 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
 {
     tabWidget = new QTabWidget;
     smashggTab = new SmashggTab(settings);
-    bracketTab = new BracketTab(settings);
-    tabWidget->addTab(smashggTab, tr("Smash.gg"));
-    tabWidget->addTab(bracketTab, tr("Challonge"));
+    tabWidget->addTab(smashggTab, tr("Start.gg"));
+
+    // These are non-secret identifiers only. They do not connect the services.
+    const auto addServiceTab = [this](const QString &title,
+                                      const QList<QPair<QString, QString>> &fields) {
+        auto *page = new QWidget(tabWidget);
+        auto *layout = new QVBoxLayout(page);
+        auto *note = new QLabel(tr("Settings below are reserved for future connections. Do not enter passwords or tokens here."), page);
+        note->setWordWrap(true);
+        layout->addWidget(note);
+        auto *form = new QFormLayout;
+        for (const auto &field : fields) {
+            auto *edit = new QLineEdit(page);
+            futureServiceFields.insert(field.first, edit);
+            form->addRow(field.second, edit);
+            connect(edit, &QLineEdit::textEdited, this, &WidgetSettingsDialog::saveDetails);
+        }
+        layout->addLayout(form);
+        layout->addStretch();
+        tabWidget->addTab(page, title);
+        return page;
+    };
+    addServiceTab(tr("Tiltify"), {{"integrations>tiltify>campaignUrl", tr("Campaign URL")}});
+    addServiceTab(tr("GDQ Tracker"), {{"integrations>gdqTracker>baseUrl", tr("Tracker base URL")},
+                                      {"integrations>gdqTracker>event", tr("Event identifier")}});
+    QWidget *parryPage = addServiceTab(tr("Parry.gg"), {{"integrations>parry>tournamentUrl", tr("Tournament URL")}});
+    tabWidget->removeTab(tabWidget->indexOf(parryPage));
+    tabWidget->insertTab(1, parryPage, tr("Parry.gg"));
+
+    auto *bracketPage = new QWidget(tabWidget);
+    auto *bracketForm = new QFormLayout(bracketPage);
+    bracketStartKey = new QLineEdit(bracketPage);
+    bracketParryKey = new QLineEdit(bracketPage);
+    bracketStartKey->setEchoMode(QLineEdit::Password);
+    bracketParryKey->setEchoMode(QLineEdit::Password);
+    bracketForm->addRow(tr("Start.gg API key:"), bracketStartKey);
+    bracketForm->addRow(tr("Parry.gg API key:"), bracketParryKey);
+    tabWidget->addTab(bracketPage, tr("Bracket"));
+    auto *lockoutPage = new QWidget(tabWidget);
+    auto *lockoutForm = new QFormLayout(lockoutPage);
+    lockoutToken = new QLineEdit(lockoutPage);
+    lockoutToken->setEchoMode(QLineEdit::Password);
+    lockoutForm->addRow(tr("Socket token:"), lockoutToken);
+    tabWidget->addTab(lockoutPage, tr("Lockout.live"));
 
     buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok
                                      | QDialogButtonBox::Cancel);
@@ -50,15 +97,19 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
     mainLayout->addWidget(tabWidget);
     mainLayout->addWidget(buttonBox);
 
-    connect(buttonBox, SIGNAL(accepted()), this, SLOT(accept()));
+    connect(buttonBox, &QDialogButtonBox::accepted, this, [this] {
+        QSettings bracket("StreamControlPlus", "BracketImport");
+        bracket.setValue("startgg/token", bracketStartKey->text());
+        bracket.setValue("parry/token", bracketParryKey->text());
+        QSettings lockout("StreamControlPlus", "LockoutViewer");
+        lockout.setValue("token", lockoutToken->text());
+        accept();
+    });
     connect(buttonBox, SIGNAL(rejected()), this, SLOT(reject()));
 
     connect(smashggTab->smashggOwnerIdEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
     connect(smashggTab->smashggStreamNameEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
     connect(smashggTab->smashggAuthenticationTokenEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
-    connect(bracketTab->challongeUsernameEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
-    connect(bracketTab->challongeApiKeyEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
-    connect(bracketTab->challongeOrganizationEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
 
     setLayout(mainLayout);
 
@@ -70,19 +121,22 @@ void WidgetSettingsDialog::saveDetails()
     settings["smashgg>ownerId"] = smashggTab->smashggOwnerIdEdit->text();
     settings["smashgg>streamName"] = smashggTab->smashggStreamNameEdit->text();
     settings["smashgg>authenticationToken"] = smashggTab->smashggAuthenticationTokenEdit->text();
-    settings["challonge>username"] = bracketTab->challongeUsernameEdit->text();
-    settings["challonge>apiKey"] = bracketTab->challongeApiKeyEdit->text();
-    settings["challonge>organization"] = bracketTab->challongeOrganizationEdit->text();
+    for (auto it = futureServiceFields.constBegin(); it != futureServiceFields.constEnd(); ++it)
+        settings[it.key()] = it.value()->text();
 }
 
 void WidgetSettingsDialog::setConfig(QMap<QString, QString> newSettings) {
     settings = newSettings;
+    QSettings bracket("StreamControlPlus", "BracketImport");
+    bracketStartKey->setText(bracket.value("startgg/token").toString());
+    bracketParryKey->setText(bracket.value("parry/token").toString());
+    QSettings lockout("StreamControlPlus", "LockoutViewer");
+    lockoutToken->setText(lockout.value("token").toString());
     smashggTab->smashggOwnerIdEdit->setText(settings.value("smashgg>ownerId"));
     smashggTab->smashggStreamNameEdit->setText(settings.value("smashgg>streamName"));
     smashggTab->smashggAuthenticationTokenEdit->setText(settings.value("smashgg>authenticationToken"));
-    bracketTab->challongeUsernameEdit->setText(settings.value("challonge>username"));
-    bracketTab->challongeApiKeyEdit->setText(settings.value("challonge>apiKey"));
-    bracketTab->challongeOrganizationEdit->setText(settings.value("challonge>organization"));
+    for (auto it = futureServiceFields.constBegin(); it != futureServiceFields.constEnd(); ++it)
+        it.value()->setText(settings.value(it.key()));
 }
 
 QMap<QString, QString> WidgetSettingsDialog::getConfig() const

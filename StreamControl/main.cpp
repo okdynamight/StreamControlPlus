@@ -31,6 +31,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QFile>
 #include <QDomDocument>
 #include <QStandardPaths>
+#include <QSettings>
+#include <QRegularExpression>
+#include <QScreen>
+#include <QWindow>
+#include <QTimer>
 
 int main(int argc, char *argv[])
 {
@@ -130,7 +135,66 @@ int main(int argc, char *argv[])
         a.setPalette(lightPalette);
     }
 
+    // Read optional colors next to settings.xml; missing or invalid values use defaults.
+#ifdef Q_OS_MACOS
+    const QString buttonColorsPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                                     + "/button-colors.ini";
+#else
+    const QString buttonColorsPath = "button-colors.ini";
+#endif
+    QSettings buttonColors(buttonColorsPath, QSettings::IniFormat);
+    const QRegularExpression hexColor(QStringLiteral("^#[0-9a-fA-F]{6}$"));
+    const auto color = [&buttonColors, &hexColor](const char *key, const char *fallback) {
+        const QString value = buttonColors.value(QLatin1String(key), QLatin1String(fallback)).toString().trimmed();
+        return hexColor.match(value).hasMatch() ? value : QString::fromLatin1(fallback);
+    };
+    const auto buttonRule = [&color](const QString &selector, const char *group,
+                                     const char *background, const char *border,
+                                     const char *hover, const char *pressed,
+                                     const char *text) {
+        const QByteArray prefix = QByteArray(group) + '/';
+        return QStringLiteral("%1 { background-color: %2; color: %3; border: 1px solid %4; }\n"
+                              "%1:hover { background-color: %5; }\n"
+                              "%1:pressed { background-color: %6; }\n")
+            .arg(selector, color((prefix + "background").constData(), background),
+                 color((prefix + "text").constData(), text),
+                 color((prefix + "border").constData(), border),
+                 color((prefix + "hover").constData(), hover),
+                 color((prefix + "pressed").constData(), pressed));
+    };
+    QString buttonStyle = QStringLiteral("QPushButton { border-radius: 4px; padding: 2px 5px; }\n");
+    buttonStyle += buttonRule(QStringLiteral("QPushButton"), "default", "#345f91", "#4977a7", "#4275ad", "#284b73", "#ffffff");
+    buttonStyle += buttonRule(QStringLiteral("QPushButton[scButtonRole=\"reset\"]"), "reset", "#963d48", "#b65b65", "#b34c59", "#772c37", "#ffffff");
+    buttonStyle += buttonRule(QStringLiteral("QPushButton[scButtonRole=\"swap\"]"), "swap", "#5c518d", "#7e72aa", "#7164a5", "#49406f", "#ffffff");
+    buttonStyle += buttonRule(QStringLiteral("QPushButton[scButtonRole=\"apply\"]"), "apply", "#286d5c", "#438d7a", "#32866f", "#205648", "#ffffff");
+    buttonStyle += QStringLiteral("QPushButton:focus { border: 2px solid %1; }\n")
+        .arg(color("states/focusBorder", "#84b9ff"));
+    buttonStyle += QStringLiteral("QPushButton:disabled, QPushButton[scButtonRole=\"reset\"]:disabled, "
+                                  "QPushButton[scButtonRole=\"swap\"]:disabled, QPushButton[scButtonRole=\"apply\"]:disabled "
+                                  "{ background-color: %1; color: %2; border-color: %3; }\n")
+        .arg(color("states/disabledBackground", "#666b72"),
+             color("states/disabledText", "#dddddd"), color("states/disabledBorder", "#73777c"));
+    buttonStyle += QStringLiteral(R"(
+        QToolBar#toolBar QToolButton { background-color: #345f91; color: white;
+            border: 1px solid #4977a7; border-radius: 4px; padding: 2px 5px; }
+        QToolBar#toolBar QToolButton:hover { background-color: #4275ad; }
+        QToolBar#toolBar QToolButton:pressed { background-color: #284b73; }
+        QToolBar#toolBar QToolButton:disabled { background-color: #666b72; color: #dddddd; }
+    )");
+    a.setStyleSheet(a.styleSheet() + buttonStyle);
+
     MainWindow mainWindow;
     mainWindow.show();
+    // Center the native frame after the window manager has created it.
+    QTimer::singleShot(0, &mainWindow, [&mainWindow] {
+        QScreen *screen = mainWindow.windowHandle() ? mainWindow.windowHandle()->screen() : nullptr;
+        if (!screen) screen = QGuiApplication::primaryScreen();
+        if (!screen) return;
+        const QRect available = screen->availableGeometry();
+        const QRect frame = mainWindow.frameGeometry();
+        const int x = available.left() + qMax(0, (available.width() - frame.width()) / 2);
+        const int y = available.top() + qMax(0, (available.height() - frame.height()) / 2);
+        mainWindow.move(x, y);
+    });
     return a.exec();
 }

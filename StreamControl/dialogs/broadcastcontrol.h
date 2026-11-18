@@ -15,6 +15,7 @@ class BroadcastControl : public QDialog
 {
 public:
     explicit BroadcastControl(QWidget *parent = nullptr);
+    void showAnimations();
 
 private:
     qint64 currentRemaining() const;
@@ -32,6 +33,7 @@ private:
     void tick();
     void publish();
     void updateDisplay();
+    void setStatus(const QString &message);
 
     QSpinBox *hours;
     QSpinBox *minutes;
@@ -47,6 +49,11 @@ private:
     QLabel *runLabel;
     QPushButton *animationOne;
     QPushButton *animationTwo;
+    QPushButton *animationThree;
+    QPushButton *animationFour;
+    QDialog *animationDialog;
+    QLabel *animationOutputLabel;
+    QLabel *animationStatusLabel;
     QLabel *timerLabel;
     QLabel *statusLabel;
     QLabel *outputLabel;
@@ -60,8 +67,12 @@ private:
     QString outputPath;
     bool triggerOne = false;
     bool triggerTwo = false;
+    bool triggerThree = false;
+    bool triggerFour = false;
     int revisionOne = 0;
     int revisionTwo = 0;
+    int revisionThree = 0;
+    int revisionFour = 0;
 };
 
 #endif

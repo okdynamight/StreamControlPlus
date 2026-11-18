@@ -34,4 +34,8 @@ win32 {
     LIBS += -luser32
 }
 
+win32-msvc* {
+    QMAKE_CXXFLAGS += /utf-8
+}
+
 CONFIG(release, debug|release):DEFINES += QT_NO_DEBUG_OUTPUT
