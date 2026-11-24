@@ -32,10 +32,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QList>
 #include <QPair>
 #include <QPushButton>
-#include <QSettings>
+#include "../portablesettings.h"
 #include "twitchpointsdialog.h"
 
-#include "smashggtab.h"
 #include "widgetsettingsdialog.h"
 
 
@@ -43,8 +42,6 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
     : QDialog(parent)
 {
     tabWidget = new QTabWidget;
-    smashggTab = new SmashggTab(settings);
-    tabWidget->addTab(smashggTab, tr("Start.gg"));
 
     // These are non-secret identifiers only. They do not connect the services.
     const auto addServiceTab = [this](const QString &title,
@@ -66,12 +63,24 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
         tabWidget->addTab(page, title);
         return page;
     };
-    addServiceTab(tr("Tiltify"), {{"integrations>tiltify>campaignUrl", tr("Campaign URL")}});
-    addServiceTab(tr("GDQ Tracker"), {{"integrations>gdqTracker>baseUrl", tr("Tracker base URL")},
-                                      {"integrations>gdqTracker>event", tr("Event identifier")}});
-    QWidget *parryPage = addServiceTab(tr("Parry.gg"), {{"integrations>parry>tournamentUrl", tr("Tournament URL")}});
-    tabWidget->removeTab(tabWidget->indexOf(parryPage));
-    tabWidget->insertTab(1, parryPage, tr("Parry.gg"));
+    auto *tiltifyPage = new QWidget(tabWidget);
+    auto *tiltifyForm = new QFormLayout(tiltifyPage);
+    tiltifyClientId = new QLineEdit(tiltifyPage);
+    tiltifyClientSecret = new QLineEdit(tiltifyPage);
+    tiltifyClientSecret->setEchoMode(QLineEdit::Password);
+    tiltifyForm->addRow(tr("Client ID:"), tiltifyClientId);
+    tiltifyForm->addRow(tr("Client secret:"), tiltifyClientSecret);
+    tabWidget->addTab(tiltifyPage, tr("Tiltify"));
+    auto *gdqPage = new QWidget(tabWidget);
+    auto *gdqForm = new QFormLayout(gdqPage);
+    gdqUrl = new QLineEdit(gdqPage); gdqEvent = new QLineEdit(gdqPage);
+    gdqUsername = new QLineEdit(gdqPage); gdqPassword = new QLineEdit(gdqPage);
+    gdqPassword->setEchoMode(QLineEdit::Password);
+    gdqForm->addRow(tr("Tracker API URL:"), gdqUrl);
+    gdqForm->addRow(tr("Event ID (optional):"), gdqEvent);
+    gdqForm->addRow(tr("Username (optional):"), gdqUsername);
+    gdqForm->addRow(tr("Password (optional):"), gdqPassword);
+    tabWidget->addTab(gdqPage, tr("GDQ Tracker"));
 
     auto *bracketPage = new QWidget(tabWidget);
     auto *bracketForm = new QFormLayout(bracketPage);
@@ -98,18 +107,21 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
     mainLayout->addWidget(buttonBox);
 
     connect(buttonBox, &QDialogButtonBox::accepted, this, [this] {
-        QSettings bracket("StreamControlPlus", "BracketImport");
+        PortableSettings bracket("StreamControlPlus", "BracketImport");
         bracket.setValue("startgg/token", bracketStartKey->text());
         bracket.setValue("parry/token", bracketParryKey->text());
-        QSettings lockout("StreamControlPlus", "LockoutViewer");
+        PortableSettings lockout("StreamControlPlus", "LockoutViewer");
         lockout.setValue("token", lockoutToken->text());
+        PortableSettings tiltify("StreamControlPlus", "Tiltify");
+        tiltify.setValue("clientId", tiltifyClientId->text().trimmed());
+        tiltify.setValue("clientSecret", tiltifyClientSecret->text());
+        PortableSettings gdq("StreamControlPlus", "GDQTracker");
+        gdq.setValue("baseUrl", gdqUrl->text().trimmed()); gdq.setValue("event", gdqEvent->text().trimmed());
+        gdq.setValue("username", gdqUsername->text().trimmed()); gdq.setValue("password", gdqPassword->text());
         accept();
     });
     connect(buttonBox, SIGNAL(rejected()), this, SLOT(reject()));
 
-    connect(smashggTab->smashggOwnerIdEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
-    connect(smashggTab->smashggStreamNameEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
-    connect(smashggTab->smashggAuthenticationTokenEdit,SIGNAL( textEdited(QString) ),this, SLOT ( saveDetails() ));
 
     setLayout(mainLayout);
 
@@ -118,23 +130,24 @@ WidgetSettingsDialog::WidgetSettingsDialog(QWidget *parent)
 
 void WidgetSettingsDialog::saveDetails()
 {
-    settings["smashgg>ownerId"] = smashggTab->smashggOwnerIdEdit->text();
-    settings["smashgg>streamName"] = smashggTab->smashggStreamNameEdit->text();
-    settings["smashgg>authenticationToken"] = smashggTab->smashggAuthenticationTokenEdit->text();
     for (auto it = futureServiceFields.constBegin(); it != futureServiceFields.constEnd(); ++it)
         settings[it.key()] = it.value()->text();
 }
 
 void WidgetSettingsDialog::setConfig(QMap<QString, QString> newSettings) {
     settings = newSettings;
-    QSettings bracket("StreamControlPlus", "BracketImport");
+    PortableSettings bracket("StreamControlPlus", "BracketImport");
     bracketStartKey->setText(bracket.value("startgg/token").toString());
     bracketParryKey->setText(bracket.value("parry/token").toString());
-    QSettings lockout("StreamControlPlus", "LockoutViewer");
+    PortableSettings lockout("StreamControlPlus", "LockoutViewer");
     lockoutToken->setText(lockout.value("token").toString());
-    smashggTab->smashggOwnerIdEdit->setText(settings.value("smashgg>ownerId"));
-    smashggTab->smashggStreamNameEdit->setText(settings.value("smashgg>streamName"));
-    smashggTab->smashggAuthenticationTokenEdit->setText(settings.value("smashgg>authenticationToken"));
+    PortableSettings tiltify("StreamControlPlus", "Tiltify");
+    tiltifyClientId->setText(tiltify.value("clientId").toString());
+    tiltifyClientSecret->setText(tiltify.value("clientSecret").toString());
+    PortableSettings gdq("StreamControlPlus", "GDQTracker");
+    gdqUrl->setText(gdq.value("baseUrl", settings.value("integrations>gdqTracker>baseUrl")).toString());
+    gdqEvent->setText(gdq.value("event", settings.value("integrations>gdqTracker>event")).toString());
+    gdqUsername->setText(gdq.value("username").toString()); gdqPassword->setText(gdq.value("password").toString());
     for (auto it = futureServiceFields.constBegin(); it != futureServiceFields.constEnd(); ++it)
         it.value()->setText(settings.value(it.key()));
 }

@@ -34,7 +34,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QMap>
 #include <QString>
 
-class SmashggTab;
 class QLineEdit;
 
 class WidgetSettingsDialog : public QDialog
@@ -56,7 +55,8 @@ private:
     QMap<QString, QLineEdit *> futureServiceFields;
 
     QLineEdit *bracketStartKey, *bracketParryKey, *lockoutToken;
-    SmashggTab* smashggTab;
+    QLineEdit *tiltifyClientId, *tiltifyClientSecret;
+    QLineEdit *gdqUrl, *gdqEvent, *gdqUsername, *gdqPassword;
 
     QTabWidget *tabWidget;
     QDialogButtonBox *buttonBox;

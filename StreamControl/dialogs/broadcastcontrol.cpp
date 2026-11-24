@@ -11,7 +11,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QSaveFile>
-#include <QSettings>
+#include "../portablesettings.h"
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -21,7 +21,7 @@
 BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
 {
     setWindowTitle(tr("Broadcast timers"));
-    QSettings saved(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
+    PortableSettings saved(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
     outputPath = saved.value("outputPath").toString();
     resize(480, 250);
     auto *layout = new QVBoxLayout(this);
@@ -86,7 +86,7 @@ BroadcastControl::BroadcastControl(QWidget *parent) : QDialog(parent)
     connect(runResetButton, &QPushButton::clicked, this, [this] { resetRun(); });
     const auto durationChanged = [this](int) { if (state == "idle") reset(); };
     hours->setValue(saved.value("hours", 0).toInt()); minutes->setValue(saved.value("minutes", 0).toInt()); seconds->setValue(saved.value("seconds", 0).toInt());
-    const auto saveDuration = [this](int) { QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls")); settings.setValue("hours", hours->value()); settings.setValue("minutes", minutes->value()); settings.setValue("seconds", seconds->value()); };
+    const auto saveDuration = [this](int) { PortableSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls")); settings.setValue("hours", hours->value()); settings.setValue("minutes", minutes->value()); settings.setValue("seconds", seconds->value()); };
     connect(hours, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
     connect(minutes, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
     connect(seconds, qOverload<int>(&QSpinBox::valueChanged), this, saveDuration);
@@ -177,7 +177,7 @@ void BroadcastControl::chooseOutput()
         setStatus(tr("Choose a separate file from the existing overlay and schedule outputs.")); return;
     }
     outputPath = path;
-    QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
+    PortableSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("BroadcastControls"));
     settings.setValue("outputPath", outputPath);
     updateDisplay(); publish();
 }
@@ -276,4 +276,40 @@ void BroadcastControl::publish()
     if (file.write(data) != data.size()) { setStatus(tr("Output failed: %1").arg(file.errorString())); file.cancelWriting(); return; }
     if (!file.commit()) { setStatus(tr("Output failed: %1").arg(file.errorString())); return; }
     setStatus(tr("Controls published."));
+}
+
+QJsonObject BroadcastControl::remoteState() const
+{
+    QJsonObject result;
+    result.insert("countdownState", state);
+    result.insert("remainingMs", double(currentRemaining()));
+    result.insert("runState", runState);
+    result.insert("elapsedMs", double(currentElapsed()));
+    result.insert("hours", hours->value()); result.insert("minutes", minutes->value()); result.insert("seconds", seconds->value());
+    result.insert("hasOutput", !outputPath.isEmpty()); result.insert("status", statusLabel->text());
+    return result;
+}
+
+QString BroadcastControl::remoteAction(const QString &action, const QJsonObject &args)
+{
+    if (action == "duration") {
+        if (state == "running" || state == "paused") return tr("Stop or reset the countdown before changing its duration.");
+        const QJsonValue h = args.value("hours"), m = args.value("minutes"), s = args.value("seconds");
+        if (!h.isDouble() || !m.isDouble() || !s.isDouble() || h.toDouble() != h.toInt(-1) || m.toDouble() != m.toInt(-1) || s.toDouble() != s.toInt(-1) || h.toInt() < 0 || h.toInt() > 999 || m.toInt() < 0 || m.toInt() > 59 || s.toInt() < 0 || s.toInt() > 59) return tr("Duration must be 0–999 hours and 0–59 minutes and seconds.");
+        hours->setValue(h.toInt()); minutes->setValue(m.toInt()); seconds->setValue(s.toInt());
+        if (state != "idle") reset();
+    } else if (action == "countdown_start") {
+        if (state != "paused" && hours->value() == 0 && minutes->value() == 0 && seconds->value() == 0) return tr("Enter a duration greater than zero.");
+        startOrResume();
+    } else if (action == "countdown_pause") pause();
+    else if (action == "countdown_stop") stop();
+    else if (action == "countdown_reset") reset();
+    else if (action == "run_start") startRun();
+    else if (action == "run_pause") pauseRun();
+    else if (action == "run_stop") stopRun();
+    else if (action == "run_reset") resetRun();
+    else return tr("Unknown timer action.");
+    if (outputPath.isEmpty()) return tr("Timer changed; choose the timer output file in StreamControl to publish.");
+    if (statusLabel->text().startsWith(tr("Output failed:"))) return statusLabel->text();
+    return QString();
 }

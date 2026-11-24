@@ -138,7 +138,7 @@ QStringList MainWindow::checkButton(QDomElement element){
         errors << "Button " + idstr + "x is not a positive integer";
     if (element.hasAttribute("y") && (element.attribute("y").toInt(&intHandler,10) < 0 || intHandler == false))
         errors << "Button " + idstr + "y is not a positive integer";
-    if (element.hasAttribute("type") && (element.attribute("type") != "reset" && element.attribute("type") != "swap" && element.attribute("type") != "timestamp" && element.attribute("type") != "setButton" && element.attribute("type") != "scoreStep" && element.attribute("type") != "teamLoad" && element.attribute("type") != "teamSave" && element.attribute("type") != "teamDelete"))
+    if (element.hasAttribute("type") && (element.attribute("type") != "reset" && element.attribute("type") != "swap" && element.attribute("type") != "timestamp" && element.attribute("type") != "setButton" && element.attribute("type") != "scoreStep" && element.attribute("type") != "matchHistory" && element.attribute("type") != "startggQueueAction" && element.attribute("type") != "teamLoad" && element.attribute("type") != "teamSave" && element.attribute("type") != "teamDelete"))
         errors << "Button " + idstr + "type is not recognised";
     if (element.attribute("type") == "reset" && !element.hasAttribute("reset"))
         errors << "Button " + idstr + "type \"reset\" must have \"reset\" attribute set";
@@ -339,5 +339,4 @@ QStringList MainWindow::checkTweetWidget(QDomElement element){
 
     return errors;
 }
-
 

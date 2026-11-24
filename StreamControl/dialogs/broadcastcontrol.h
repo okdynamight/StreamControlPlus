@@ -4,6 +4,7 @@
 #include <QDialog>
 #include <QElapsedTimer>
 #include <QString>
+#include <QJsonObject>
 
 class QLabel;
 class QPushButton;
@@ -16,6 +17,8 @@ class BroadcastControl : public QDialog
 public:
     explicit BroadcastControl(QWidget *parent = nullptr);
     void showAnimations();
+    QJsonObject remoteState() const;
+    QString remoteAction(const QString &action, const QJsonObject &args);
 
 private:
     qint64 currentRemaining() const;

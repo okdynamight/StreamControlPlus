@@ -25,6 +25,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 **********************************************************************************/
 
+#include <cstdlib>
 #include <QSignalMapper>
 #include <QToolBar>
 #include <QAction>
@@ -35,6 +36,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QVBoxLayout>
 #include <QSet>
 #include <QToolButton>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QInputDialog>
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
@@ -45,7 +50,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
-#include <QSettings>
+#include "portablesettings.h"
 #include <QJsonValue>
 #include <QProcess>
 #include <QScrollArea>
@@ -58,6 +63,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QStandardPaths>
 
 
+#include "dialogs/tiltifydialog.h"
+#include "dialogs/gdqtrackerdialog.h"
 #include "dialogs/broadcastcontrol.h"
 #include "dialogs/bingodialog.h"
 #include "dialogs/bracketimportdialog.h"
@@ -81,6 +88,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "mainwindow.h"
 #include <QTimer>
 #include <functional>
+#include <memory>
+#include <algorithm>
+#include <QUrlQuery>
 #include <QCryptographicHash>
 #include <QSignalBlocker>
 #include <QLineEdit>
@@ -143,6 +153,11 @@ bool publishScoreOnly(const QString &outputPath, int format, const QString &id, 
 
 MainWindow::MainWindow()
 {
+    QString portableError;
+    if (!PortableSettings::initialize(&portableError)) {
+        QMessageBox::critical(nullptr, tr("Portable settings"), portableError);
+        std::exit(EXIT_FAILURE);
+    }
     if (objectName().isEmpty())
                 setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(tr("StreamControl Plus"));
@@ -189,7 +204,11 @@ MainWindow::MainWindow()
 
 
     QMenu *configMenu = new QMenu();
+    auto *tiltifyDialog = new TiltifyDialog([this] { return settings.value(QStringLiteral("outputPath")); }, this);
+    auto *tiltifyAction = new QAction(tr("Tiltify"), this);
+    connect(tiltifyAction, &QAction::triggered, tiltifyDialog, [tiltifyDialog] { tiltifyDialog->show(); tiltifyDialog->raise(); tiltifyDialog->activateWindow(); });
     auto *broadcastControl = new BroadcastControl(this);
+    broadcastControl->setObjectName(QStringLiteral("sc-remote-timers"));
     QAction *actionTimers = new QAction(tr("Timers"), this);
     connect(actionTimers, &QAction::triggered, this, [broadcastControl] {
         broadcastControl->show(); broadcastControl->raise(); broadcastControl->activateWindow();
@@ -208,10 +227,16 @@ MainWindow::MainWindow()
     QAction *actionLockout = new QAction(tr("Lockout.live Viewer"), this);
     connect(actionLockout, &QAction::triggered, this, [lockoutViewer] { lockoutViewer->show(); lockoutViewer->raise(); lockoutViewer->activateWindow(); });
     configMenu->addAction(actionLockout);
+    configMenu->addAction(tiltifyAction);
+    auto *gdqDialog = new GdqTrackerDialog([this] { return settings.value(QStringLiteral("outputPath")); }, this);
+    auto *gdqAction = new QAction(tr("GDQ Tracker"), this);
+    connect(gdqAction, &QAction::triggered, gdqDialog, [gdqDialog] { gdqDialog->show(); gdqDialog->raise(); gdqDialog->activateWindow(); });
+    configMenu->addAction(gdqAction);
     QAction *actionConfig = new QAction("Configuration", this);
     configMenu->addAction(actionConfig);
     QAction *actionSchedule = new QAction("Schedule", this);
     auto *scheduleDialog = new ScheduleDialog(this);
+    scheduleDialog->setObjectName(QStringLiteral("sc-remote-schedule"));
     connect(actionSchedule, &QAction::triggered, scheduleDialog, &QDialog::show);
     scheduleDialog->setApplyToLayoutHandler([this, scheduleDialog](const QJsonObject &entry, bool configure) {
         QStringList fields = {"scheduled_start", "game", "category", "system", "release_year", "estimate"};
@@ -225,7 +250,7 @@ MainWindow::MainWindow()
             defaults[QString("runner_%1_platform").arg(i)] = QString("sr-runner-%1-platform").arg(i);
             defaults[QString("runner_%1_service").arg(i)] = QString("sr-runner-service-%1").arg(i);
         }
-        QSettings mappingSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("ScheduleMappings"));
+        PortableSettings mappingSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("ScheduleMappings"));
         const QByteArray hash=QCryptographicHash::hash(settings.value("layoutPath").toUtf8(), QCryptographicHash::Sha256).toHex();
         mappingSettings.beginGroup(QString::fromLatin1(hash));
         if (configure) {
@@ -250,18 +275,22 @@ MainWindow::MainWindow()
             for(const QString &field:fields)mappingSettings.setValue(field,boxes.value(field)->currentData().toString());
             return;
         }
+        const auto report = [scheduleDialog](const QString &message) {
+            if (scheduleDialog->property("scRemoteApply").toBool()) scheduleDialog->setProperty("scRemoteError", message);
+            else QMessageBox::warning(scheduleDialog, QObject::tr("Schedule mapping"), message);
+        };
         QSet<QString> assigned; QJsonArray actions;
         for(const QString &field:fields) {
             if(!entry.contains(field)) continue;
             const QString id=mappingSettings.value(field,defaults.value(field)).toString(); if(id.isEmpty())continue;
-            if(assigned.contains(id)){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("A dashboard field is mapped more than once. Check the mapping."));return;} assigned.insert(id);
-            const QString type=widgetType.value(id); if((type!="lineEdit"&&type!="comboBox")||!widgetList.value(id)){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("Dashboard field '%1' is missing. Configure the mapping for this layout.").arg(id));return;}
+            if(assigned.contains(id)){report(tr("A dashboard field is mapped more than once. Check the mapping."));return;} assigned.insert(id);
+            const QString type=widgetType.value(id); if((type!="lineEdit"&&type!="comboBox")||!widgetList.value(id)){report(tr("Dashboard field '%1' is missing. Configure the mapping for this layout.").arg(id));return;}
             const QString value=entry.value(field).toString();
-            if(type=="comboBox") { auto *combo=qobject_cast<QComboBox*>(widgetList.value(id)); if(!combo || (combo->findData(value)<0 && combo->findText(value)<0 && !combo->isEditable())) {QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("The value '%1' is not available in '%2'. No fields were changed.").arg(value,id));return;} }
+            if(type=="comboBox") { auto *combo=qobject_cast<QComboBox*>(widgetList.value(id)); if(!combo || (combo->findData(value)<0 && combo->findText(value)<0 && !combo->isEditable())) {report(tr("The value '%1' is not available in '%2'. No fields were changed.").arg(value,id));return;} }
             QJsonObject action;action.insert("action","set");action.insert("id",id);action.insert("value",value);actions.append(action);
         }
-        if(actions.isEmpty()){QMessageBox::information(scheduleDialog,tr("Schedule mapping"),tr("No matching schedule fields were available. Configure the dashboard mapping."));return;}
-        for(const auto &value:actions){const QString error=applyRemoteAction(value.toObject());if(!error.isEmpty()){QMessageBox::warning(scheduleDialog,tr("Schedule mapping"),tr("Could not apply: %1. Earlier fields may have changed.").arg(error));return;}}
+        if(actions.isEmpty()){report(tr("No matching schedule fields were available. Configure the dashboard mapping."));return;}
+        for(const auto &value:actions){const QString error=applyRemoteAction(value.toObject());if(!error.isEmpty()){report(tr("Could not apply: %1. Earlier fields may have changed.").arg(error));return;}}
     });
     QAction *actionSchedulePrevious = new QAction(QStringLiteral("←"), this);
     QAction *actionScheduleApply = new QAction(tr("Apply"), this);
@@ -417,20 +446,18 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, long *r
 }
 
 void MainWindow::loadSettings() {
-    #ifdef Q_OS_MACOS
-        QFile file(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)+"/settings.xml");
-    #else
-        QFile file("settings.xml");
-    #endif
+    PortableSettings portable(QStringLiteral("StreamControlPlus"), QStringLiteral("Main"));
+    const QString storedXml = portable.value(QStringLiteral("xml")).toString();
     QString outputPath;
     QString layoutPath;
-    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    if (!storedXml.isEmpty()) {
 
         QDomDocument doc;
-        doc.setContent(&file);
-        file.close();
+        doc.setContent(storedXml);
 
         loadSettingsFromXml(doc.namedItem("settings"), settings);
+        PortableSettings secrets(QStringLiteral("StreamControlPlus"), QStringLiteral("MainSecrets"));
+        for (const QString &key : secrets.allKeys()) settings.insert(key, secrets.value(key).toString());
 
         //load old name (xsplitPath) if coming from 0.3 or lower
         outputPath = settings.value("outputPath", settings.value("xsplitPath"));
@@ -499,16 +526,9 @@ void MainWindow::loadSettings() {
 
 
 /*
-    Saves the complete contents of the settings map to the settings xml file.
+    Saves the main settings XML inside the portable JSON file.
 */
 void MainWindow::saveSettings() {
-    #ifdef Q_OS_MACOS
-        QFile file(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)+"/settings.xml");
-    #else
-        QFile file("settings.xml");
-    #endif
-    file.open(QIODevice::WriteOnly | QIODevice::Text);
-
     QDomDocument doc ("StreamControl");
     // Allows us to wrap text in CDATA tags if the contents are invalid
     doc.implementation().setInvalidDataPolicy(QDomImplementation::ReturnNullNode);
@@ -516,8 +536,13 @@ void MainWindow::saveSettings() {
     QDomElement settingsXML = doc.createElement("settings");
     doc.appendChild(settingsXML);
 
+    PortableSettings secrets(QStringLiteral("StreamControlPlus"), QStringLiteral("MainSecrets"));
     foreach(const QString& key, settings.keys())
     {
+        if (PortableSettings::sensitive(QStringLiteral("Main"), key)) {
+            secrets.setValue(key, settings.value(key));
+            continue;
+        }
         QString elementName;
 
         QDomNode currentElement = settingsXML;
@@ -552,10 +577,8 @@ void MainWindow::saveSettings() {
         }
     }
 
-    QTextStream out(&file);
-    out.setEncoding(QStringConverter::Utf8);
-    out << doc.toString();
-    file.close();
+    PortableSettings portable(QStringLiteral("StreamControlPlus"), QStringLiteral("Main"));
+    portable.setValue(QStringLiteral("xml"), doc.toString());
 }
 
 /*
@@ -610,6 +633,8 @@ void MainWindow::loadXML() {
     QMapIterator<QString, QObject *> i(widgetList);
     while (i.hasNext()) {
         i.next();
+        // The event link comes from Bracket settings; H2H results belong to the current selection.
+        if (i.key() == QStringLiteral("schedule-event-url") || i.key().startsWith(QStringLiteral("h2h-"))) continue;
         QString wType = widgetType[i.key()];
         QDomElement currElement = items.namedItem(i.key()).toElement();
 
@@ -651,6 +676,8 @@ void MainWindow::loadJSON() {
     QMapIterator<QString, QObject *> i(widgetList);
     while (i.hasNext()) {
         i.next();
+        // The event link comes from Bracket settings; H2H results belong to the current selection.
+        if (i.key() == QStringLiteral("schedule-event-url") || i.key().startsWith(QStringLiteral("h2h-"))) continue;
         QString wType = widgetType[i.key()];
 
         if (wType == "lineEdit") {
@@ -775,6 +802,12 @@ QString MainWindow::saveXML() {
 
             QDomText newItemt = doc.createTextNode(value);
             newItem.appendChild(newItemt);
+            auto *combo = static_cast<ScComboBox *>(widgetList[i.key()]);
+            if (combo->property("scCatalogType").toString() == QStringLiteral("skins") || i.key().startsWith(QStringLiteral("stage-strike-stage-"))) {
+                QDomElement image = doc.createElement(i.key() + QStringLiteral("-image"));
+                image.appendChild(doc.createTextNode(combo->currentData(Qt::UserRole + 1).toString()));
+                items.appendChild(image);
+            }
         } else if (wType == "radioGroup") {
             QString value = ((ScRadioGroup*)widgetList[i.key()])->getCurrentRadio();
 
@@ -1043,6 +1076,9 @@ QString MainWindow::saveJSON() {
             }
 
             Obj[i.key()] = value;
+            auto *combo = static_cast<ScComboBox *>(widgetList[i.key()]);
+            if (combo->property("scCatalogType").toString() == QStringLiteral("skins") || i.key().startsWith(QStringLiteral("stage-strike-stage-")))
+                Obj[i.key() + QStringLiteral("-image")] = combo->currentData(Qt::UserRole + 1).toString();
         } else if (wType == "radioGroup") {
             QString value = ((ScRadioGroup*)widgetList[i.key()])->getCurrentRadio();
             Obj[i.key()] = value;
@@ -1405,6 +1441,13 @@ void MainWindow::loadLayout() {
 
     layoutIterator = 0;
 
+    // Stop callbacks belonging to the old layout before clearing its widget maps.
+    // QMainWindow::setCentralWidget normally deletes the previous widget later.
+    if (QWidget *oldLayout = takeCentralWidget()) {
+        oldLayout->blockSignals(true);
+        for (QObject *child : oldLayout->findChildren<QObject *>()) child->blockSignals(true);
+        delete oldLayout;
+    }
     clearMaps();
     //keyPoller->stop();
     deleteHotkeys();
@@ -1496,65 +1539,47 @@ void MainWindow::loadLayout() {
         parseCLI(cliNode);
     }
 
-    // Stage-striking catalog is independent of the layout and broadcast output.
-    // Games and their stage names are stored per layout. The normal Save button
-    // controls when the chosen stages and ban flags are published.
-    auto *stageGame = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-game")));
-    if (stageGame && stageGame->isEditable()) {
-        const QString scope = QString::fromLatin1(QCryptographicHash::hash(settings.value("layoutPath").toUtf8(), QCryptographicHash::Sha256).toHex());
-        const auto gamePrefix = [scope](const QString &name) {
-            return scope + QStringLiteral("/games/") + QString::fromLatin1(QCryptographicHash::hash(name.trimmed().toUtf8(), QCryptographicHash::Sha256).toHex());
-        };
-        QList<QComboBox *> stages;
-        for (int i=1; i<=9; ++i) {
-            auto *combo=qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-stage-%1").arg(i)));
-            if(combo && combo->isEditable()) stages.append(combo);
-        }
-        QSettings saved(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
-        const QStringList games=saved.value(scope+QStringLiteral("/gameNames")).toStringList();
-        for(const QString &name:games) if(stageGame->findText(name)<0) stageGame->addItem(name,name);
-        const QString last=saved.value(scope+QStringLiteral("/lastGame")).toString();
-        if(!last.isEmpty()) stageGame->setCurrentText(last);
-        const auto refreshStages = [stageGame, stages, gamePrefix] {
-            QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
-            const QString game=stageGame->currentText().trimmed();
-            const QString key=gamePrefix(game); const QStringList options=game.isEmpty()?QStringList():s.value(key+QStringLiteral("/stages")).toStringList();
-            for(int i=0;i<stages.size();++i) {
-                QComboBox *box=stages.at(i); QSignalBlocker blocked(box); box->clear(); box->addItem(QObject::tr("Select stage"), QString());
-                for(const QString &name:options) box->addItem(name,name);
-                const QString selected=game.isEmpty()?QString():s.value(key+QStringLiteral("/slot%1").arg(i+1)).toString();
-                const int idx=box->findText(selected); if(idx>=0 && !selected.isEmpty()) box->setCurrentIndex(idx); else if(!selected.isEmpty()) box->setEditText(selected); else box->setCurrentIndex(0);
+    // Populate stage choices from the shared catalog using the layout's game selector.
+    {
+        auto *stageGame = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-game-select"), nullptr));
+        if (stageGame) {
+            const QString path = QFileInfo(settings.value(QStringLiteral("layoutPath"))).dir().filePath(QStringLiteral("character-catalog.json"));
+            QFile file(path);
+            QJsonObject stages;
+            if (file.open(QIODevice::ReadOnly)) {
+                const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+                if (doc.isObject()) stages = doc.object().value(QStringLiteral("stages")).toObject();
             }
-        };
-        const auto commitGame = [stageGame, scope, refreshStages] {
-            const QString name=stageGame->currentText().trimmed(); if(name.isEmpty()) return;
-            QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
-            QStringList games=s.value(scope+QStringLiteral("/gameNames")).toStringList();
-            if(!games.contains(name,Qt::CaseInsensitive)) { games.append(name); s.setValue(scope+QStringLiteral("/gameNames"),games); }
-            s.setValue(scope+QStringLiteral("/lastGame"),name);
-            if(stageGame->findText(name)<0) { QSignalBlocker blocked(stageGame);stageGame->addItem(name,name);stageGame->setCurrentText(name); }
-            refreshStages();
-        };
-        connect(stageGame, &QComboBox::currentTextChanged, stageGame, [refreshStages](const QString &) { refreshStages(); });
-        connect(stageGame, qOverload<int>(&QComboBox::activated), stageGame, [commitGame](int) { commitGame(); });
-        connect(stageGame->lineEdit(), &QLineEdit::editingFinished, stageGame, commitGame);
-        for(int i=0;i<stages.size();++i) {
-            QComboBox *box=stages.at(i);
-            const auto saveStage = [stageGame, box, stages, gamePrefix, i] {
-                const QString game=stageGame->currentText().trimmed();
-                QString value=box->currentText().trimmed();
-                if(box->currentIndex()==0 && value==QObject::tr("Select stage")) value.clear();
-                if(game.isEmpty()) return;
-                QSettings s(QStringLiteral("StreamControlPlus"), QStringLiteral("StageStriking"));
-                const QString key=gamePrefix(game); QStringList options=s.value(key+QStringLiteral("/stages")).toStringList();
-                if(!value.isEmpty() && !options.contains(value,Qt::CaseInsensitive)) { options.append(value); s.setValue(key+QStringLiteral("/stages"), options); }
-                s.setValue(key+QStringLiteral("/slot%1").arg(i+1),value);
-                if(!value.isEmpty()) for(QComboBox *other:stages) if(other->findText(value)<0) { QSignalBlocker blocked(other); other->addItem(value,value); }
+            QList<QComboBox *> boxes;
+            for (int i = 1; i <= 9; ++i) {
+                auto *box = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("stage-strike-stage-%1").arg(i), nullptr));
+                if (box) boxes.append(box);
+            }
+            const auto updateStages = [stageGame, boxes, stages] {
+                const QString game = stageGame->currentData().toString();
+                const QJsonArray choices = stages.value(game).toArray();
+                for (QComboBox *box : boxes) {
+                    const QString selected = box->currentData().toString();
+                    box->clear();
+                    box->addItem(QObject::tr("Select stage"), QString());
+                    for (const QJsonValue &entry : choices) {
+                        const QJsonObject item = entry.toObject();
+                        const QString name = item.value(QStringLiteral("name")).toString();
+                        const QString value = item.value(QStringLiteral("value")).toString();
+                        if (!name.isEmpty() && !value.isEmpty()) {
+                            box->addItem(name, value);
+                            const QJsonArray images = item.value(QStringLiteral("images")).toArray();
+                            if (!images.isEmpty()) box->setItemData(box->count() - 1, images.first().toString(), Qt::UserRole + 1);
+                        }
+                    }
+                    const int index = box->findData(selected);
+                    if (index >= 0) box->setCurrentIndex(index);
+                }
             };
-            connect(box, qOverload<int>(&QComboBox::activated), box, [saveStage](int) { saveStage(); });
-            connect(box->lineEdit(), &QLineEdit::editingFinished, box, saveStage);
+            connect(stageGame, qOverload<int>(&QComboBox::currentIndexChanged), stageGame,
+                    [updateStages](int) { updateStages(); });
+            updateStages();
         }
-        refreshStages();
     }
 
     // Optional team database: present only on layouts with the matching team widgets.
@@ -1656,12 +1681,51 @@ void MainWindow::loadLayout() {
         }
     }
 
+    // Load shared game/character entries once per catalog, relative to the layout file.
+    QMap<QString, QJsonObject> characterCatalogs;
+    QSet<QString> invalidCatalogs;
+    for (auto it = widgetType.cbegin(); it != widgetType.cend(); ++it) {
+        if (it.value() != QStringLiteral("comboBox")) continue;
+        auto *box = qobject_cast<ScComboBox *>(widgetList.value(it.key(), nullptr));
+        if (!box) continue;
+        const QString filename = box->property("scCatalogFile").toString();
+        if (filename.isEmpty()) continue;
+        const QString path = QFileInfo(settings.value(QStringLiteral("layoutPath"))).dir().filePath(filename);
+        if (!characterCatalogs.contains(path) && !invalidCatalogs.contains(path)) {
+            QFile file(path); QJsonParseError error;
+            if (!file.open(QIODevice::ReadOnly)) { invalidCatalogs.insert(path); }
+            else {
+                const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
+                if (error.error != QJsonParseError::NoError || !document.isObject() || !document.object().value(QStringLiteral("games")).isObject()) invalidCatalogs.insert(path);
+                else characterCatalogs.insert(path, document.object().value(QStringLiteral("games")).toObject());
+            }
+        }
+        if (invalidCatalogs.contains(path)) continue;
+        if (box->property("scCatalogType").toString() == QStringLiteral("skins")) continue;
+        QVariantList items;
+        QVariantMap placeholder; placeholder.insert(QStringLiteral("text"), tr("Select character")); placeholder.insert(QStringLiteral("value"), QString()); placeholder.insert(QStringLiteral("when"), QString()); items.append(placeholder);
+        const QJsonObject games = characterCatalogs.value(path);
+        for (auto game = games.constBegin(); game != games.constEnd(); ++game) {
+            for (const QJsonValue &character : game.value().toArray()) {
+                const QJsonObject item = character.toObject();
+                const QString name = item.value(QStringLiteral("name")).toString();
+                const QString value = item.value(QStringLiteral("value")).toString();
+                if (name.isEmpty() || value.isEmpty()) continue;
+                QVariantMap option; option.insert(QStringLiteral("text"), name); option.insert(QStringLiteral("value"), value); option.insert(QStringLiteral("when"), game.key()); items.append(option);
+            }
+        }
+        box->setProperty("scConditionalItems", items);
+    }
+    if (!invalidCatalogs.isEmpty())
+        QMessageBox::warning(this, tr("Character catalog"), tr("Could not read the character catalog. Place character-catalog.json beside the layout and reload it.\n%1").arg(QStringList(invalidCatalogs.values()).join(QStringLiteral("\n"))));
+
     // Wire conditional choices only after every layout widget exists.
     QList<std::function<void()>> conditionalRefreshes;
     for (auto it = widgetType.cbegin(); it != widgetType.cend(); ++it) {
         if (it.value() != "comboBox") continue;
         auto *dependent = qobject_cast<ScComboBox *>(widgetList.value(it.key()));
         if (!dependent) continue;
+        if (dependent->property("scCatalogType").toString() == QStringLiteral("skins")) continue;
         const QString sourceId = dependent->property("scDependsOn").toString();
         if (sourceId.isEmpty() || widgetType.value(sourceId) != "comboBox") continue;
         // Ignore cycles rather than recursively emitting selection changes.
@@ -1691,6 +1755,684 @@ void MainWindow::loadLayout() {
         conditionalRefreshes.append(update);
     }
     for (const auto &update : conditionalRefreshes) update();
+
+    // Skin choices depend on both the selected character and its game.
+    for (auto it = widgetType.cbegin(); it != widgetType.cend(); ++it) {
+        if (it.value() != QStringLiteral("comboBox")) continue;
+        auto *skinBox = qobject_cast<ScComboBox *>(widgetList.value(it.key(), nullptr));
+        if (!skinBox || skinBox->property("scCatalogType").toString() != QStringLiteral("skins")) continue;
+        const QString characterId = skinBox->property("scDependsOn").toString();
+        auto *characterBox = qobject_cast<ScComboBox *>(widgetList.value(characterId, nullptr));
+        if (!characterBox) continue;
+        const QString gameId = characterBox->property("scDependsOn").toString();
+        auto *gameBox = qobject_cast<ScComboBox *>(widgetList.value(gameId, nullptr));
+        if (!gameBox) continue;
+        const QString path = QFileInfo(settings.value(QStringLiteral("layoutPath"))).dir().filePath(
+            skinBox->property("scCatalogFile").toString());
+        const QJsonObject games = characterCatalogs.value(path);
+        const QVariantList fallback = skinBox->property("scConditionalItems").toList();
+        const auto updateSkins = [skinBox, characterBox, gameBox, games, fallback] {
+            const QString game = gameBox->currentData().toString();
+            const QString character = characterBox->currentData().toString();
+            const QString previousGame = skinBox->property("scSkinGame").toString();
+            const QString previousCharacter = skinBox->property("scSkinCharacter").toString();
+            const QString selected = skinBox->currentData().toString();
+            skinBox->setProperty("scSkinGame", game);
+            skinBox->setProperty("scSkinCharacter", character);
+            skinBox->clear();
+            skinBox->addItem(QObject::tr("Select skin"), QString());
+            if (!game.isEmpty() && !character.isEmpty()) {
+                QJsonArray skins;
+                const QJsonArray characters = games.value(game).toArray();
+                for (const QJsonValue &entry : characters) {
+                    const QJsonObject item = entry.toObject();
+                    if (item.value(QStringLiteral("value")).toString() == character) {
+                        skins = item.value(QStringLiteral("skins")).toArray();
+                        break;
+                    }
+                }
+                for (const QJsonValue &entry : skins) {
+                    const QJsonObject skin = entry.toObject();
+                    const QString name = skin.value(QStringLiteral("name")).toString();
+                    const QString value = skin.value(QStringLiteral("value")).toString();
+                    if (!name.isEmpty() && !value.isEmpty()) {
+                        skinBox->addItem(name, value);
+                        const QJsonArray images = skin.value(QStringLiteral("images")).toArray();
+                        if (!images.isEmpty()) skinBox->setItemData(skinBox->count() - 1, images.first().toString(), Qt::UserRole + 1);
+                    }
+                }
+                // Keep the layout's existing choices when no cataloged skins exist yet.
+                if (skinBox->count() == 1) {
+                    for (const QVariant &entry : fallback) {
+                        const QVariantMap option = entry.toMap();
+                        const QString value = option.value(QStringLiteral("value")).toString();
+                        if (!value.isEmpty()) skinBox->addItem(option.value(QStringLiteral("text")).toString(), value);
+                    }
+                }
+            }
+            if (game == previousGame && character == previousCharacter) {
+                const int index = skinBox->findData(selected);
+                if (index >= 0) skinBox->setCurrentIndex(index);
+            }
+        };
+        connect(characterBox, qOverload<int>(&QComboBox::currentIndexChanged), skinBox,
+                [updateSkins](int) { updateSkins(); });
+        connect(gameBox, qOverload<int>(&QComboBox::currentIndexChanged), skinBox,
+                [updateSkins](int) { updateSkins(); });
+        updateSkins();
+    }
+
+    // Start.gg stream queue controls are optional in custom layouts.
+    auto *sggList = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("schedule-startgg-queue"), nullptr));
+    auto *sggRefresh = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("schedule-startgg-refresh"), nullptr));
+    auto *sggAdd = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("schedule-startgg-add"), nullptr));
+    if (sggList && sggRefresh && sggAdd) {
+        auto *network = new QNetworkAccessManager(sggList);
+        connect(sggRefresh, &QPushButton::clicked, sggList, [this, sggList, sggRefresh, network] {
+            PortableSettings config(QStringLiteral("StreamControlPlus"), QStringLiteral("BracketImport"));
+            const QUrl eventUrl(config.value(QStringLiteral("startgg/url")).toString().trimmed());
+            const QString token = config.value(QStringLiteral("startgg/token")).toString().trimmed();
+            const QStringList parts = eventUrl.path().split('/', Qt::SkipEmptyParts);
+            if (eventUrl.scheme() != QStringLiteral("https") || !eventUrl.userInfo().isEmpty() ||
+                (eventUrl.host().toLower() != QStringLiteral("start.gg") && eventUrl.host().toLower() != QStringLiteral("www.start.gg")) ||
+                parts.size() < 2 || parts.at(0) != QStringLiteral("tournament") || token.isEmpty() || token.contains('\r') || token.contains('\n')) {
+                QMessageBox::warning(this, tr("Start.gg queue"), tr("Set a Start.gg tournament/event URL in the bracket importer and an API key in Widget Settings → Bracket.")); return;
+            }
+            QJsonObject variables; variables.insert(QStringLiteral("tourneySlug"), QStringLiteral("tournament/") + parts.at(1));
+            QJsonObject body; body.insert(QStringLiteral("variables"), variables);
+            body.insert(QStringLiteral("query"), QStringLiteral("query StreamQueue($tourneySlug: String!) { tournament(slug: $tourneySlug) { streamQueue { stream { streamName streamSource } sets { id fullRoundText event { videogame { id } } slots { entrant { id name participants { player { id } } } } } } } }"));
+            QNetworkRequest req(QUrl(QStringLiteral("https://api.start.gg/gql/alpha")));
+            req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            req.setRawHeader("Authorization", QByteArray("Bearer ") + token.toUtf8()); req.setTransferTimeout(15000);
+            req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+            sggRefresh->setEnabled(false);
+            auto *reply = network->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            connect(reply, &QNetworkReply::finished, sggList, [this, reply, sggList, sggRefresh] {
+                const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                QJsonParseError parse; const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &parse);
+                const bool failed = reply->error() != QNetworkReply::NoError; reply->deleteLater(); sggRefresh->setEnabled(true);
+                const QJsonObject root = doc.object(); const QJsonArray errors = root.value(QStringLiteral("errors")).toArray();
+                const QJsonValue tournament = root.value(QStringLiteral("data")).toObject().value(QStringLiteral("tournament"));
+                if (failed || http != 200 || parse.error != QJsonParseError::NoError || !errors.isEmpty() || !tournament.isObject() || !tournament.toObject().value(QStringLiteral("streamQueue")).isArray()) {
+                    const QString detail = errors.isEmpty() ? tr("HTTP %1 or invalid response").arg(http) : errors.first().toObject().value(QStringLiteral("message")).toString();
+                    QMessageBox::warning(this, tr("Start.gg queue"), tr("Could not load stream queue: %1").arg(detail)); return;
+                }
+                sggList->clear(); sggList->addItem(tr("Select a Start.gg match"), QVariant()); int count = 0;
+                for (const auto &streamEntry : tournament.toObject().value(QStringLiteral("streamQueue")).toArray()) {
+                    const QJsonObject entry = streamEntry.toObject(); const QString stream = entry.value(QStringLiteral("stream")).toObject().value(QStringLiteral("streamName")).toString();
+                    for (const auto &setValue : entry.value(QStringLiteral("sets")).toArray()) {
+                        const QJsonObject set = setValue.toObject(); const QJsonArray setSlots = set.value(QStringLiteral("slots")).toArray();
+                        const QString p1 = setSlots.size() > 0 ? setSlots.at(0).toObject().value(QStringLiteral("entrant")).toObject().value(QStringLiteral("name")).toString() : QString();
+                        const QString p2 = setSlots.size() > 1 ? setSlots.at(1).toObject().value(QStringLiteral("entrant")).toObject().value(QStringLiteral("name")).toString() : QString();
+                        if (p1.isEmpty() || p2.isEmpty()) continue;
+                        QVariantMap item; item.insert(QStringLiteral("p1"), p1); item.insert(QStringLiteral("p2"), p2); item.insert(QStringLiteral("round"), set.value(QStringLiteral("fullRoundText")).toString());
+                        for (int player = 0; player < 2; ++player) {
+                            const QJsonObject entrant = setSlots.at(player).toObject().value(QStringLiteral("entrant")).toObject();
+                            const QJsonArray participants = entrant.value(QStringLiteral("participants")).toArray();
+                            if (participants.size() == 1) {
+                                const QJsonValue id = participants.first().toObject().value(QStringLiteral("player")).toObject().value(QStringLiteral("id"));
+                                item.insert(QStringLiteral("playerId%1").arg(player + 1), id.toVariant().toString());
+                            }
+                        }
+                        const QJsonValue gameId = set.value(QStringLiteral("event")).toObject().value(QStringLiteral("videogame")).toObject().value(QStringLiteral("id"));
+                        item.insert(QStringLiteral("gameId"), gameId.toVariant().toString());
+                        sggList->addItem(QStringLiteral("%1: %2 vs %3 — %4").arg(stream.isEmpty() ? tr("Stream") : stream, p1, p2, item.value(QStringLiteral("round")).toString()), item); ++count;
+                    }
+                }
+                statusBar()->showMessage(tr("Loaded %1 Start.gg queue matches.").arg(count), 10000);
+            });
+        });
+        connect(sggAdd, &QPushButton::clicked, sggList, [this, sggList] {
+            const QVariantMap item = sggList->currentData().toMap();
+            if (item.isEmpty()) { QMessageBox::information(this, tr("Start.gg queue"), tr("Select a match first.")); return; }
+            for (int row = 1; row <= 10; ++row) {
+                auto *p1 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                auto *p2 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                if (!p1 || !p2 || !round) { QMessageBox::warning(this, tr("Start.gg queue"), tr("The layout is missing queue fields.")); return; }
+                if (p1->text().trimmed().isEmpty() && p2->text().trimmed().isEmpty() && round->text().trimmed().isEmpty()) {
+                    p1->setText(item.value(QStringLiteral("p1")).toString()); p2->setText(item.value(QStringLiteral("p2")).toString()); round->setText(item.value(QStringLiteral("round")).toString());
+                    statusBar()->showMessage(tr("Match added to queue. Save the dashboard to publish it."), 10000); return;
+                }
+            }
+            QMessageBox::warning(this, tr("Start.gg queue"), tr("All ten queue rows contain information. Clear a row before adding a match."));
+        });
+    }
+
+
+    // Mirror the bracket event URL on the Schedule and Head-to-Head pages.
+    auto *scheduleUrl = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-event-url"), nullptr));
+    auto *h2hUrl = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-event-url"), nullptr));
+    auto *bracketPanel = findChild<QWidget *>(QStringLiteral("bracket-import-panel"));
+    auto *bracketUrl = bracketPanel ? bracketPanel->findChild<QLineEdit *>(QStringLiteral("bracket-event-url")) : nullptr;
+    auto *bracketProvider = bracketPanel ? bracketPanel->findChild<QComboBox *>(QStringLiteral("bracket-provider-selector")) : nullptr;
+    const auto mirrorUrl = [scheduleUrl, h2hUrl](const QString &value) {
+        for (QLineEdit *edit : {scheduleUrl, h2hUrl}) {
+            if (edit && edit->text() != value) { QSignalBlocker blocked(edit); edit->setText(value); }
+        }
+    };
+    if (bracketUrl) {
+        mirrorUrl(bracketUrl->text());
+        connect(bracketUrl, &QLineEdit::textChanged, this, mirrorUrl);
+        if (bracketProvider) connect(bracketProvider, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [bracketUrl, mirrorUrl](int) { mirrorUrl(bracketUrl->text()); });
+    } else {
+        PortableSettings config(QStringLiteral("StreamControlPlus"), QStringLiteral("BracketImport"));
+        mirrorUrl(config.value(QStringLiteral("startgg/url")).toString());
+    }
+    const auto commitUrl = [bracketUrl, bracketProvider, mirrorUrl](QLineEdit *source) {
+        if (!source) return;
+        const QString value = source->text().trimmed();
+        if (bracketUrl) {
+            const QString host = QUrl(value).host().toLower();
+            if (bracketProvider) {
+                QString provider;
+                if (host == QStringLiteral("start.gg") || host == QStringLiteral("www.start.gg")) provider = QStringLiteral("startgg");
+                else if (host == QStringLiteral("parry.gg")) provider = QStringLiteral("parry");
+                if (!provider.isEmpty()) { const int index = bracketProvider->findData(provider); if (index >= 0) bracketProvider->setCurrentIndex(index); }
+            }
+            bracketUrl->setText(value);
+        } else {
+            PortableSettings config(QStringLiteral("StreamControlPlus"), QStringLiteral("BracketImport"));
+            config.setValue(QStringLiteral("startgg/url"), value);
+        }
+        mirrorUrl(value);
+    };
+    for (QLineEdit *edit : {scheduleUrl, h2hUrl}) if (edit)
+        connect(edit, &QLineEdit::editingFinished, this, [edit, commitUrl] { commitUrl(edit); });
+
+    // Load participants for the selected start.gg event and look up their H2H.
+    auto *h2hPlayer1 = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("h2h-player-1"), nullptr));
+    auto *h2hPlayer2 = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("h2h-player-2"), nullptr));
+    auto *h2hGame = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("h2h-game"), nullptr));
+    auto *h2hLoad = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("h2h-load-entrants"), nullptr));
+    auto *h2hFilter = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("h2h-filter"), nullptr));
+    auto *h2hRefresh = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("h2h-refresh"), nullptr));
+    auto *h2hStatus = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-status"), nullptr));
+    auto *h2hP1Sets = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-p1-sets"), nullptr));
+    auto *h2hP2Sets = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-p2-sets"), nullptr));
+    auto *h2hP1Games = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-p1-games"), nullptr));
+    auto *h2hP2Games = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-p2-games"), nullptr));
+    if (h2hUrl && h2hPlayer1 && h2hPlayer2 && h2hGame && h2hLoad && h2hFilter && h2hRefresh && h2hStatus && h2hP1Sets && h2hP2Sets && h2hP1Games && h2hP2Games) {
+        auto *network = new QNetworkAccessManager(h2hRefresh);
+        QList<QLineEdit *> recentFields;
+        for (int i = 1; i <= 5; ++i) if (auto *field = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("h2h-recent-%1").arg(i), nullptr))) recentFields.append(field);
+        QList<QList<QLineEdit *>> recentParts;
+        const QStringList partNames = {QStringLiteral("player-1"), QStringLiteral("player-2"), QStringLiteral("score"), QStringLiteral("event"), QStringLiteral("round")};
+        for (int i = 1; i <= 5; ++i) {
+            QList<QLineEdit *> fields;
+            for (const QString &part : partNames) {
+                const QString id = QStringLiteral("h2h-recent-%1-%2").arg(i).arg(part);
+                auto *field = qobject_cast<ScLineEdit *>(widgetList.value(id, nullptr));
+                if (!field) {
+                    field = new ScLineEdit(h2hRefresh);
+                    field->setObjectName(id);
+                    field->hide();
+                    widgetList.insert(id, field);
+                    widgetType.insert(id, QStringLiteral("lineEdit"));
+                }
+                fields.append(field);
+            }
+            recentParts.append(fields);
+        }
+        for (QComboBox *box : {h2hPlayer1, h2hPlayer2}) {
+            if (!box->isEditable()) box->setEditable(true);
+            if (box->completer()) { box->completer()->setCaseSensitivity(Qt::CaseInsensitive); box->completer()->setFilterMode(Qt::MatchContains); box->completer()->setCompletionMode(QCompleter::PopupCompletion); }
+            box->lineEdit()->setPlaceholderText(QObject::tr("Select an entrant or search Supermajor by name"));
+        }
+        const auto playerId = [](QComboBox *box) -> QString {
+            const QString text = box->currentText().trimmed();
+            const int index = box->currentIndex();
+            if (index >= 0 && box->itemText(index) == text) {
+                const QString id = box->itemData(index).toString();
+                if (QRegularExpression(QStringLiteral("^S[0-9]+$")).match(id).hasMatch()) return id;
+            }
+            QString matchedId;
+            for (int i = 0; i < box->count(); ++i) {
+                const QString candidateId = box->itemData(i).toString();
+                if (!QRegularExpression(QStringLiteral("^S[0-9]+$")).match(candidateId).hasMatch()) continue;
+                const QString suffix = QStringLiteral(" (%1)").arg(candidateId);
+                const QString label = box->itemText(i);
+                QString tag = box->itemData(i, Qt::UserRole + 2).toString();
+                if (tag.isEmpty()) tag = label.endsWith(suffix) ? label.left(label.size() - suffix.size()) : label;
+                if (tag.compare(text, Qt::CaseInsensitive) == 0) {
+                    if (!matchedId.isEmpty() && matchedId != candidateId) return QString();
+                    matchedId = candidateId;
+                }
+            }
+            if (!matchedId.isEmpty()) return matchedId;
+            QString id = text;
+            const QUrl url(text);
+            if (url.isValid() && (url.host().compare(QStringLiteral("supermajor.gg"), Qt::CaseInsensitive) == 0 || url.host().compare(QStringLiteral("www.supermajor.gg"), Qt::CaseInsensitive) == 0)) id = QUrlQuery(url).queryItemValue(QStringLiteral("id"));
+            if (QRegularExpression(QStringLiteral("^[0-9]+$")).match(id).hasMatch()) id.prepend(QLatin1Char('S'));
+            return QRegularExpression(QStringLiteral("^S[0-9]+$")).match(id).hasMatch() ? id : QString();
+        };
+        const auto clearResults = [h2hP1Sets, h2hP2Sets, h2hP1Games, h2hP2Games, recentFields, recentParts] {
+            for (QLineEdit *field : {h2hP1Sets, h2hP2Sets, h2hP1Games, h2hP2Games}) field->clear();
+            for (QLineEdit *field : recentFields) field->clear();
+            for (const auto &row : recentParts) for (QLineEdit *field : row) field->clear();
+        };
+        const auto lookup = [h2hPlayer1, h2hPlayer2, h2hGame, h2hFilter, h2hRefresh, h2hStatus, h2hP1Sets, h2hP2Sets, h2hP1Games, h2hP2Games, recentFields, recentParts, network, playerId, clearResults] {
+            const int serial = h2hRefresh->property("h2hSerial").toInt() + 1;
+            h2hRefresh->setProperty("h2hSerial", serial); clearResults();
+            const QString p1 = playerId(h2hPlayer1), p2 = playerId(h2hPlayer2), sport = h2hGame->currentData().toString();
+            if (p1.isEmpty() || p2.isEmpty()) { h2hStatus->setText(QObject::tr("Select two players from the suggestions (or enter Supermajor IDs)")); return; }
+            if (p1 == p2) { h2hStatus->setText(QObject::tr("Select two different players")); return; }
+            if (sport.isEmpty()) { h2hStatus->setText(QObject::tr("Select Melee or Ultimate")); return; }
+            QJsonObject body; body.insert(QStringLiteral("sport"), sport); body.insert(QStringLiteral("p1PlayerId"), p1); body.insert(QStringLiteral("p2PlayerId"), p2);
+            body.insert(QStringLiteral("tab"), QStringLiteral("overview")); body.insert(QStringLiteral("globalFilterContext"), h2hFilter->currentData().toString()); body.insert(QStringLiteral("globalDateRange"), QStringLiteral("All Time"));
+            QJsonObject matches; matches.insert(QStringLiteral("filterToP1Wins"), false); matches.insert(QStringLiteral("filterToP2Wins"), false); matches.insert(QStringLiteral("sortBy"), QStringLiteral("date_desc"));
+            QJsonObject placements; placements.insert(QStringLiteral("sortBy"), QStringLiteral("date_desc"));
+            body.insert(QStringLiteral("matchesTabSettings"), matches); body.insert(QStringLiteral("placementsTabSettings"), placements); body.insert(QStringLiteral("filterToVods"), false); body.insert(QStringLiteral("limitToOldRankings"), false);
+            QNetworkRequest request(QUrl(QStringLiteral("https://slpurukxtnleofuopadw.supabase.co/functions/v1/h2h-sheet-v2")));
+            request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            const QByteArray publicKey("sb_publishable_ENByDjqQbyXQHXqtfx5EHQ_VZMrFtEu");
+            request.setRawHeader("apikey", publicKey); request.setRawHeader("Authorization", QByteArray("Bearer ") + publicKey);
+            request.setRawHeader("Origin", "https://www.supermajor.gg"); request.setRawHeader("Referer", "https://www.supermajor.gg/"); request.setTransferTimeout(15000); request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+            h2hStatus->setText(QObject::tr("Loading head-to-head..."));
+            auto *reply = network->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            QObject::connect(reply, &QNetworkReply::finished, h2hRefresh, [reply, serial, h2hRefresh, h2hStatus, h2hP1Sets, h2hP2Sets, h2hP1Games, h2hP2Games, recentFields, recentParts, p1, p2] {
+                const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(); const bool failed = reply->error() != QNetworkReply::NoError; const QByteArray bytes = reply->readAll(); reply->deleteLater();
+                if (h2hRefresh->property("h2hSerial").toInt() != serial) return;
+                QJsonParseError error; const QJsonDocument doc = QJsonDocument::fromJson(bytes, &error);
+                if (failed || http != 200 || error.error != QJsonParseError::NoError || !doc.isObject()) { h2hStatus->setText(QObject::tr("Supermajor request failed (HTTP %1)").arg(http)); return; }
+                const QJsonObject data = doc.object().value(QStringLiteral("data")).toObject(), one = data.value(QStringLiteral("p1_info")).toObject(), two = data.value(QStringLiteral("p2_info")).toObject();
+                const QJsonObject sets = data.value(QStringLiteral("matches_winrate")).toObject(), games = data.value(QStringLiteral("games_winrate")).toObject();
+                if (one.value(QStringLiteral("player_id")).toString() != p1 || two.value(QStringLiteral("player_id")).toString() != p2 || !sets.value(QStringLiteral("wins")).isDouble() || !sets.value(QStringLiteral("losses")).isDouble() || !games.value(QStringLiteral("wins")).isDouble() || !games.value(QStringLiteral("losses")).isDouble()) { h2hStatus->setText(QObject::tr("No verified Supermajor record for these IDs")); return; }
+                h2hP1Sets->setText(QString::number(sets.value(QStringLiteral("wins")).toInt())); h2hP2Sets->setText(QString::number(sets.value(QStringLiteral("losses")).toInt())); h2hP1Games->setText(QString::number(games.value(QStringLiteral("wins")).toInt())); h2hP2Games->setText(QString::number(games.value(QStringLiteral("losses")).toInt()));
+                const QJsonArray recent = data.value(QStringLiteral("last_5_matches")).toArray();
+                for (int i = 0; i < recent.size() && i < recentParts.size(); ++i) {
+                    const QJsonObject set = recent.at(i).toObject(), left = set.value(QStringLiteral("p1_info")).toObject(), right = set.value(QStringLiteral("p2_info")).toObject(), event = set.value(QStringLiteral("event_info")).toObject();
+                    const QString leftScore = left.value(QStringLiteral("score")).isDouble() ? QString::number(left.value(QStringLiteral("score")).toInt()) : QStringLiteral("?");
+                    const QString rightScore = right.value(QStringLiteral("score")).isDouble() ? QString::number(right.value(QStringLiteral("score")).toInt()) : QStringLiteral("?");
+                    const QString leftName = left.value(QStringLiteral("tag")).toString();
+                    const QString rightName = right.value(QStringLiteral("tag")).toString();
+                    const QString eventName = event.value(QStringLiteral("tournament_name")).toString();
+                    const QString round = set.value(QStringLiteral("location_name")).toString();
+                    const QString score = QStringLiteral("%1 - %2").arg(leftScore, rightScore);
+                    const QList<QLineEdit *> row = recentParts.at(i);
+                    row.at(0)->setText(leftName); row.at(1)->setText(rightName);
+                    row.at(2)->setText(score); row.at(3)->setText(eventName); row.at(4)->setText(round);
+                    if (i < recentFields.size()) recentFields.at(i)->setText(QStringLiteral("%1 %2 - %3 %4 | %5 | %6").arg(leftName, leftScore, rightScore, rightName, eventName, round));
+                }
+                h2hStatus->setText(QObject::tr("Loaded %1 vs %2; Save to publish").arg(one.value(QStringLiteral("tag")).toString(), two.value(QStringLiteral("tag")).toString()));
+            });
+        };
+        const auto loadEntrants = [h2hUrl, h2hPlayer1, h2hPlayer2, h2hGame, h2hLoad, h2hRefresh, h2hStatus, network, commitUrl, clearResults] {
+            commitUrl(h2hUrl);
+            const int generation = h2hLoad->property("rosterGeneration").toInt() + 1; h2hLoad->setProperty("rosterGeneration", generation);
+            h2hRefresh->setProperty("h2hSerial", h2hRefresh->property("h2hSerial").toInt() + 1); clearResults();
+            const QUrl url(h2hUrl->text().trimmed()); const QStringList parts = url.path().split('/', Qt::SkipEmptyParts);
+            if (url.scheme() != QStringLiteral("https") || (url.host().toLower() != QStringLiteral("start.gg") && url.host().toLower() != QStringLiteral("www.start.gg")) || parts.size() < 4 || parts.at(0) != QStringLiteral("tournament") || parts.at(2) != QStringLiteral("event")) { h2hStatus->setText(QObject::tr("Enter a start.gg tournament/event URL")); return; }
+            const QString slug = QStringLiteral("tournament/") + parts.at(1) + QStringLiteral("/event/") + parts.at(3);
+            PortableSettings config(QStringLiteral("StreamControlPlus"), QStringLiteral("BracketImport")); const QByteArray token = config.value(QStringLiteral("startgg/token")).toString().trimmed().toUtf8();
+            if (token.isEmpty() || token.contains('\r') || token.contains('\n')) { h2hStatus->setText(QObject::tr("Set your start.gg API key in Widget Settings")); return; }
+            h2hLoad->setEnabled(false); h2hStatus->setText(QObject::tr("Loading event entrants..."));
+            struct RosterState {
+                QMap<QString, QString> roster;
+                QString eventId;
+                QString gameId;
+                int nextPage = 1;
+                int totalPages = -1;
+                int inFlight = 0;
+                int completed = 0;
+                bool failed = false;
+            };
+            const auto state = std::make_shared<RosterState>();
+            auto pump = std::make_shared<std::function<void()>>();
+            const std::weak_ptr<std::function<void()>> weakPump = pump;
+            *pump = [network, h2hLoad, h2hStatus, h2hPlayer1, h2hPlayer2, h2hGame, slug, token, state, generation, weakPump] {
+                auto next = weakPump.lock();
+                if (!next || state->failed || h2hLoad->property("rosterGeneration").toInt() != generation) return;
+                if (state->totalPages >= 0 && state->nextPage > state->totalPages) return;
+                if (state->inFlight >= 3) {
+                    QTimer::singleShot(1000, h2hLoad, [next] { (*next)(); });
+                    return;
+                }
+                const int page = state->nextPage++;
+                ++state->inFlight;
+                QJsonObject variables; variables.insert(QStringLiteral("slug"), slug); variables.insert(QStringLiteral("page"), page);
+                QJsonObject body; body.insert(QStringLiteral("query"), QStringLiteral("query EventPlayers($slug:String!,$page:Int!){event(slug:$slug){id videogame{id} entrants(query:{page:$page,perPage:50}){pageInfo{totalPages} nodes{participants{gamerTag player{id}}}}}}")); body.insert(QStringLiteral("variables"), variables);
+                QNetworkRequest request(QUrl(QStringLiteral("https://api.start.gg/gql/alpha"))); request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json")); request.setRawHeader("Authorization", QByteArray("Bearer ") + token); request.setTransferTimeout(15000); request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+                auto *reply = network->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+                if (state->totalPages >= 0 && state->nextPage <= state->totalPages)
+                    QTimer::singleShot(1000, h2hLoad, [next] { (*next)(); });
+                QObject::connect(reply, &QNetworkReply::finished, h2hLoad, [reply, h2hLoad, h2hStatus, h2hPlayer1, h2hPlayer2, h2hGame, state, generation, page, next] {
+                    const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(); const bool failed = reply->error() != QNetworkReply::NoError; const QByteArray bytes = reply->readAll(); reply->deleteLater();
+                    if (state->failed || h2hLoad->property("rosterGeneration").toInt() != generation) return;
+                    --state->inFlight;
+                    QJsonParseError error; const QJsonDocument doc = QJsonDocument::fromJson(bytes, &error); const QJsonObject root = doc.object(); const QJsonArray errors = root.value(QStringLiteral("errors")).toArray();
+                    const QJsonObject event = root.value(QStringLiteral("data")).toObject().value(QStringLiteral("event")).toObject(), entrants = event.value(QStringLiteral("entrants")).toObject();
+                    if (failed || http != 200 || error.error != QJsonParseError::NoError || !errors.isEmpty() || entrants.isEmpty()) {
+                        state->failed = true; h2hLoad->setEnabled(true);
+                        h2hStatus->setText(errors.isEmpty() ? QObject::tr("Could not load entrants (HTTP %1); retry").arg(http) : errors.first().toObject().value(QStringLiteral("message")).toString()); return;
+                    }
+                    const QJsonValue pagesValue = entrants.value(QStringLiteral("pageInfo")).toObject().value(QStringLiteral("totalPages"));
+                    const int totalPages = pagesValue.toInt(-1);
+                    const QString eventId = event.value(QStringLiteral("id")).toVariant().toString();
+                    if (!pagesValue.isDouble() || totalPages < 0 || totalPages > 1000 || eventId.isEmpty() || !entrants.value(QStringLiteral("nodes")).isArray() || (totalPages == 0 && !entrants.value(QStringLiteral("nodes")).toArray().isEmpty()) || (page != 1 && (totalPages != state->totalPages || eventId != state->eventId))) {
+                        state->failed = true; h2hLoad->setEnabled(true); h2hStatus->setText(QObject::tr("Event entrants changed or pagination was invalid; retry")); return;
+                    }
+                    if (page == 1) {
+                        state->totalPages = totalPages; state->eventId = eventId;
+                        state->gameId = event.value(QStringLiteral("videogame")).toObject().value(QStringLiteral("id")).toVariant().toString();
+                    }
+                    for (const QJsonValue &entry : entrants.value(QStringLiteral("nodes")).toArray()) {
+                        const QJsonArray participants = entry.toObject().value(QStringLiteral("participants")).toArray();
+                        if (participants.size() != 1) continue;
+                        const QJsonObject participant = participants.first().toObject(), player = participant.value(QStringLiteral("player")).toObject();
+                        const QString id = player.value(QStringLiteral("id")).toVariant().toString(), tag = participant.value(QStringLiteral("gamerTag")).toString().trimmed();
+                        if (!id.isEmpty() && !tag.isEmpty()) state->roster.insert(QStringLiteral("S") + id, tag);
+                    }
+                    ++state->completed;
+                    if (page == 1 && totalPages > 1) QTimer::singleShot(1000, h2hLoad, [next] { (*next)(); });
+                    if (state->completed < totalPages) { h2hStatus->setText(QObject::tr("Loading entrants: %1 of %2 pages").arg(state->completed).arg(totalPages)); return; }
+                    QList<QPair<QString, QString>> sorted; for (auto i = state->roster.cbegin(); i != state->roster.cend(); ++i) sorted.append(qMakePair(i.value(), i.key()));
+                    std::sort(sorted.begin(), sorted.end(), [](const QPair<QString, QString> &a, const QPair<QString, QString> &b) { return QString::localeAwareCompare(a.first, b.first) < 0; });
+                    for (QComboBox *box : {h2hPlayer1, h2hPlayer2}) {
+                        QSignalBlocker guard(box); box->clear(); box->addItem(QString(), QString());
+                        for (const auto &player : sorted) box->addItem(QStringLiteral("%1 (%2)").arg(player.first, player.second), player.second);
+                        box->setCurrentIndex(0); box->setEditText(QString());
+                    }
+                    const QString sport = state->gameId == QStringLiteral("1") ? QStringLiteral("melee") : state->gameId == QStringLiteral("1386") ? QStringLiteral("ultimate") : QString();
+                    const int index = h2hGame->findData(sport); if (index >= 0) h2hGame->setCurrentIndex(index);
+                    h2hLoad->setEnabled(true); h2hStatus->setText(QObject::tr("Loaded %1 singles entrants. Select two players.").arg(sorted.size()));
+                });
+            };
+            (*pump)();
+        };
+        const auto invalidate = [h2hLoad, h2hRefresh, h2hPlayer1, h2hPlayer2, h2hStatus, clearResults] {
+            h2hLoad->setProperty("rosterGeneration", h2hLoad->property("rosterGeneration").toInt() + 1); h2hRefresh->setProperty("h2hSerial", h2hRefresh->property("h2hSerial").toInt() + 1); h2hLoad->setEnabled(true);
+            for (QComboBox *box : {h2hPlayer1, h2hPlayer2}) { QSignalBlocker guard(box); box->clear(); box->addItem(QString(), QString()); box->setEditText(QString()); }
+            clearResults(); h2hStatus->setText(QObject::tr("Event changed; load entrants"));
+        };
+        if (bracketUrl) {
+            connect(bracketUrl, &QLineEdit::textChanged, h2hLoad, [invalidate](const QString &) { invalidate(); });
+            if (bracketProvider) connect(bracketProvider, qOverload<int>(&QComboBox::currentIndexChanged), h2hLoad, [invalidate](int) { invalidate(); });
+        } else for (QLineEdit *edit : {scheduleUrl, h2hUrl}) if (edit) connect(edit, &QLineEdit::editingFinished, h2hLoad, invalidate);
+        connect(h2hLoad, &QPushButton::clicked, h2hLoad, [loadEntrants] { loadEntrants(); });
+        const auto autoLoad = [h2hUrl, h2hLoad, loadEntrants] {
+            const QUrl url(h2hUrl->text().trimmed()); const QStringList parts = url.path().split('/', Qt::SkipEmptyParts);
+            PortableSettings config(QStringLiteral("StreamControlPlus"), QStringLiteral("BracketImport"));
+            if (h2hLoad->isEnabled() && (url.host().toLower() == QStringLiteral("start.gg") || url.host().toLower() == QStringLiteral("www.start.gg")) && parts.size() >= 4 && parts.at(0) == QStringLiteral("tournament") && parts.at(2) == QStringLiteral("event") && !config.value(QStringLiteral("startgg/token")).toString().trimmed().isEmpty()) loadEntrants();
+        };
+        for (QLineEdit *edit : {scheduleUrl, h2hUrl, bracketUrl}) if (edit) connect(edit, &QLineEdit::editingFinished, h2hLoad, [autoLoad] { autoLoad(); });
+        QTimer::singleShot(0, h2hLoad, [autoLoad] { autoLoad(); });
+        for (QComboBox *box : {h2hPlayer1, h2hPlayer2}) {
+            auto *searchTimer = new QTimer(box);
+            searchTimer->setSingleShot(true);
+            searchTimer->setInterval(500);
+            connect(box->lineEdit(), &QLineEdit::textEdited, searchTimer, [box, searchTimer](const QString &) {
+                box->setProperty("h2hSearchGeneration", box->property("h2hSearchGeneration").toInt() + 1);
+                searchTimer->start();
+            });
+            connect(box, qOverload<int>(&QComboBox::activated), searchTimer, [box, searchTimer](int) {
+                box->setProperty("h2hSearchGeneration", box->property("h2hSearchGeneration").toInt() + 1);
+                searchTimer->stop();
+            });
+            connect(h2hGame, qOverload<int>(&QComboBox::currentIndexChanged), searchTimer, [box, searchTimer](int) {
+                box->setProperty("h2hSearchGeneration", box->property("h2hSearchGeneration").toInt() + 1);
+                searchTimer->stop();
+                const QString current = box->currentText();
+                const QString selectedId = box->currentData().toString();
+                QSignalBlocker guard(box);
+                for (int i = box->count() - 1; i >= 0; --i)
+                    if (box->itemData(i, Qt::UserRole + 1).toBool() && box->itemData(i).toString() != selectedId) box->removeItem(i);
+                box->setEditText(current);
+            });
+            connect(searchTimer, &QTimer::timeout, box, [box, h2hGame, h2hStatus, network] {
+                const QString term = box->currentText().trimmed();
+                const QString sport = h2hGame->currentData().toString();
+                const int generation = box->property("h2hSearchGeneration").toInt();
+                if (term.size() < 2 || sport.isEmpty() || term.contains(QStringLiteral("://")) || QRegularExpression(QStringLiteral("^S?[0-9]+$"), QRegularExpression::CaseInsensitiveOption).match(term).hasMatch()) return;
+                QJsonObject body; body.insert(QStringLiteral("sport"), sport); body.insert(QStringLiteral("searchTerm"), term);
+                body.insert(QStringLiteral("searchMode"), QStringLiteral("all-players")); body.insert(QStringLiteral("limitToOldRankings"), false);
+                QNetworkRequest request(QUrl(QStringLiteral("https://slpurukxtnleofuopadw.supabase.co/functions/v1/player-search-v2")));
+                request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                const QByteArray publicKey("sb_publishable_ENByDjqQbyXQHXqtfx5EHQ_VZMrFtEu");
+                request.setRawHeader("apikey", publicKey); request.setRawHeader("Authorization", QByteArray("Bearer ") + publicKey);
+                request.setRawHeader("Origin", "https://www.supermajor.gg"); request.setRawHeader("Referer", "https://www.supermajor.gg/");
+                request.setTransferTimeout(15000); request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+                auto *reply = network->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+                QObject::connect(reply, &QNetworkReply::finished, box, [reply, box, h2hGame, h2hStatus, term, sport, generation] {
+                    const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                    const bool failed = reply->error() != QNetworkReply::NoError;
+                    const QByteArray bytes = reply->readAll(); reply->deleteLater();
+                    if (box->property("h2hSearchGeneration").toInt() != generation || box->currentText().trimmed() != term || h2hGame->currentData().toString() != sport) return;
+                    QJsonParseError error; const QJsonDocument doc = QJsonDocument::fromJson(bytes, &error);
+                    if (failed || http != 200 || error.error != QJsonParseError::NoError || !doc.isObject() || !doc.object().value(QStringLiteral("data")).isArray()) {
+                        h2hStatus->setText(QObject::tr("Supermajor player search failed (HTTP %1)").arg(http)); return;
+                    }
+                    const QJsonArray results = doc.object().value(QStringLiteral("data")).toArray();
+                    int added = 0;
+                    {
+                        QSignalBlocker guard(box);
+                        for (int i = box->count() - 1; i >= 0; --i)
+                            if (box->itemData(i, Qt::UserRole + 1).toBool()) box->removeItem(i);
+                        for (const QJsonValue &value : results) {
+                            const QJsonObject player = value.toObject();
+                            const QString id = player.value(QStringLiteral("player_id")).toString();
+                            const QString tag = player.value(QStringLiteral("tag")).toString().trimmed();
+                            if (tag.isEmpty() || !QRegularExpression(QStringLiteral("^S[0-9]+$")).match(id).hasMatch() || box->findData(id) >= 0) continue;
+                            const QString sponsor = player.value(QStringLiteral("sponsor")).toString().trimmed();
+                            const QString country = player.value(QStringLiteral("country")).toString().trimmed();
+                            const QString state = player.value(QStringLiteral("state")).toString().trimmed();
+                            QString label = sponsor.isEmpty() ? tag : sponsor + QStringLiteral(" | ") + tag;
+                            QStringList location; if (!country.isEmpty()) location.append(country); if (!state.isEmpty()) location.append(state);
+                            if (!location.isEmpty()) label += QStringLiteral(" [%1]").arg(location.join(QStringLiteral(", ")));
+                            label += QStringLiteral(" (%1)").arg(id);
+                            box->addItem(label, id);
+                            const int index = box->count() - 1;
+                            box->setItemData(index, true, Qt::UserRole + 1);
+                            box->setItemData(index, tag, Qt::UserRole + 2);
+                            ++added;
+                        }
+                        box->setEditText(term);
+                    }
+                    h2hStatus->setText(QObject::tr("Supermajor search: %1 new matches; select a player").arg(added));
+                    if (box->lineEdit()->hasFocus() && box->completer()) {
+                        box->completer()->setCompletionPrefix(term);
+                        box->completer()->complete();
+                    }
+                });
+            });
+            connect(box->lineEdit(), &QLineEdit::textEdited, h2hRefresh, [h2hRefresh, h2hStatus, clearResults](const QString &) {
+                h2hRefresh->setProperty("h2hSerial", h2hRefresh->property("h2hSerial").toInt() + 1); clearResults(); h2hStatus->setText(QObject::tr("Select two players and refresh H2H"));
+            });
+            connect(box, qOverload<int>(&QComboBox::activated), h2hRefresh, [lookup](int) { lookup(); });
+            connect(box->lineEdit(), &QLineEdit::editingFinished, h2hRefresh, [lookup] { lookup(); });
+        }
+        connect(h2hFilter, qOverload<int>(&QComboBox::currentIndexChanged), h2hRefresh, [lookup](int) { lookup(); });
+        connect(h2hGame, qOverload<int>(&QComboBox::currentIndexChanged), h2hRefresh, [lookup](int) { lookup(); });
+        connect(h2hRefresh, &QPushButton::clicked, h2hRefresh, [lookup] { lookup(); });
+        h2hStatus->setText(QObject::tr("Load event entrants or search players by name"));
+    }
+
+    auto *sggDestination = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("schedule-startgg-destination"), nullptr));
+    auto *sggSend = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("schedule-startgg-send"), nullptr));
+    if (sggList && sggDestination && sggSend) {
+        connect(sggSend, &QPushButton::clicked, sggList, [this, sggList, sggDestination, sggSend] {
+            sggSend->setProperty("queueSendSucceeded", false);
+            const QVariantMap match = sggList->currentData().toMap();
+            if (match.isEmpty()) { QMessageBox::information(this, tr("Start.gg"), tr("Select a Start.gg match first.")); return; }
+            const QString target = sggDestination->currentData().toString();
+            QString first, second, round;
+            if (target == QStringLiteral("main")) { first = "scoreboard-player-1"; second = "scoreboard-player-2"; round = "scoreboard-round"; }
+            else if (target.size() == 1 && QStringLiteral("abcd").contains(target)) { first = "multi-player-1" + target; second = "multi-player-2" + target; round = "multi-round"; }
+            else { QMessageBox::warning(this, tr("Start.gg"), tr("Select a scoreboard destination.")); return; }
+            struct PlayerChoice { QString name; QString prefix; QString dataset; int index = -1; };
+            auto choose = [this](const QString &id, const QString &source, PlayerChoice *out) -> bool {
+                auto *field = qobject_cast<ScLineEdit *>(widgetList.value(id, nullptr));
+                if (!field) { QMessageBox::warning(this, tr("Start.gg"), tr("The destination player field is missing: %1").arg(id)); return false; }
+                const QString dataset = field->getDataSetName(); const QList<QStringList> columns = dataSets.value(dataset);
+                const int column = dataAssoc.value(id, -1); const QStringList names = column >= 0 && column < columns.size() ? columns.at(column) : QStringList();
+                QList<int> exact; for (int i = 0; i < names.size(); ++i) if (names.at(i).trimmed().compare(source.trimmed(), Qt::CaseInsensitive) == 0) exact.append(i);
+                QString tag = source.section('|', -1).trimmed();
+                if (exact.isEmpty() && tag != source.trimmed()) for (int i = 0; i < names.size(); ++i) if (names.at(i).trimmed().compare(tag, Qt::CaseInsensitive) == 0) exact.append(i);
+                out->dataset = dataset;
+                if (exact.size() == 1) { out->index = exact.first(); out->name = names.at(out->index); return true; }
+                // Prefer close player-name matches; compare without sponsor tags or punctuation.
+                auto normalize = [](const QString &input) {
+                    QString text = input.section('|', -1).trimmed().toCaseFolded();
+                    text.remove(QRegularExpression(QStringLiteral("[^\\p{L}\\p{N}]")));
+                    return text;
+                };
+                const QString wanted = normalize(source);
+                auto similar = [&wanted, &normalize](const QString &candidate) {
+                    const QString name = normalize(candidate);
+                    if (wanted.isEmpty() || name.isEmpty()) return false;
+                    if (wanted == name) return true;
+                    if (qMin(wanted.size(), name.size()) >= 3 && (wanted.contains(name) || name.contains(wanted))) return true;
+                    if (wanted.size() > 100 || name.size() > 100) return false;
+                    QVector<int> prev(name.size() + 1), next(name.size() + 1);
+                    for (int j = 0; j <= name.size(); ++j) prev[j] = j;
+                    for (int i = 1; i <= wanted.size(); ++i) {
+                        next[0] = i;
+                        for (int j = 1; j <= name.size(); ++j) next[j] = qMin(qMin(next[j - 1] + 1, prev[j] + 1), prev[j - 1] + (wanted.at(i - 1) == name.at(j - 1) ? 0 : 1));
+                        prev.swap(next);
+                    }
+                    const int maxLen = qMax(wanted.size(), name.size());
+                    return maxLen >= 3 && prev[name.size()] <= qMax(1, maxLen / 3);
+                };
+                QStringList options; options << tr("Keep Start.gg name: %1").arg(source);
+                QList<int> matchingRows;
+                for (int i = 0; i < names.size(); ++i) if (similar(names.at(i))) {
+                    matchingRows.append(i); options << QStringLiteral("%1 — %2").arg(i + 1).arg(names.at(i));
+                }
+                bool ok = false;
+                const QString chosen = QInputDialog::getItem(this, tr("Choose player"), tr("Choose a database entry for %1, or keep the Start.gg name:").arg(source), options, 0, false, &ok);
+                if (!ok) return false;
+                const int choice = options.indexOf(chosen);
+                if (choice <= 0) {
+                    out->index = -1;
+                    const int separator = source.lastIndexOf('|');
+                    if (separator >= 0 && !source.mid(separator + 1).trimmed().isEmpty()) {
+                        out->name = source.mid(separator + 1).trimmed();
+                        out->prefix = source.left(separator).trimmed();
+                    } else out->name = source.trimmed();
+                } else { out->index = matchingRows.at(choice - 1); out->name = names.at(out->index); }
+                return true;
+            };
+            PlayerChoice a, b;
+            if (!choose(first, match.value("p1").toString(), &a) || !choose(second, match.value("p2").toString(), &b)) return;
+            auto apply = [this](const QString &id, const PlayerChoice &player) {
+                auto *name = qobject_cast<ScLineEdit *>(widgetList.value(id)); name->setText(player.name);
+                const QList<QStringList> columns = dataSets.value(player.dataset);
+                for (const QString &slave : dataMaster.value(id)) {
+                    const int column = dataAssoc.value(slave, -1);
+                    QString value = player.index >= 0 && column >= 0 && column < columns.size() && player.index < columns.at(column).size() ? columns.at(column).at(player.index) : QString();
+                    if (player.index < 0 && slave.contains(QStringLiteral("-sponsor-"))) value = player.prefix;
+                    QObject *object = widgetList.value(slave, nullptr);
+                    if (auto *line = qobject_cast<QLineEdit *>(object)) line->setText(value);
+                    else if (auto *combo = qobject_cast<QComboBox *>(object)) { if (combo->isEditable()) combo->setEditText(value); else combo->setCurrentIndex(combo->findText(value)); }
+                }
+            };
+            apply(first, a); apply(second, b);
+            if (auto *field = qobject_cast<QComboBox *>(widgetList.value(round, nullptr))) { const QString value = match.value("round").toString(); const int pos = field->findText(value); if (pos >= 0) field->setCurrentIndex(pos); else if (field->isEditable()) field->setEditText(value); }
+            sggSend->setProperty("queueSendSucceeded", true);
+            statusBar()->showMessage(tr("Match loaded. Save the dashboard to publish it."), 10000);
+        });
+    }
+
+    auto *localQueue = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("schedule-local-queue"), nullptr));
+    auto *localRecall = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("schedule-local-recall"), nullptr));
+    // Layouts with direct destination buttons do not need a visible recall button.
+    if (localQueue && !localRecall) {
+        localRecall = new QPushButton(localQueue);
+        localRecall->hide();
+    }
+    if (localQueue && localRecall && sggList && sggSend && sggDestination) {
+        auto updateQueue = [this, localQueue] {
+            const int selectedRow = localQueue->currentData().toInt();
+            QSignalBlocker guard(localQueue);
+            localQueue->clear(); localQueue->addItem(tr("Select a queued match"), 0);
+            for (int row = 1; row <= 10; ++row) {
+                auto *first = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                auto *second = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                if (first && second && round && (!first->text().trimmed().isEmpty() || !second->text().trimmed().isEmpty() || !round->text().trimmed().isEmpty()))
+                    localQueue->addItem(tr("%1: %2 vs %3 — %4").arg(row).arg(first->text(), second->text(), round->text()), row);
+            }
+            const int index = localQueue->findData(selectedRow); if (index >= 0) localQueue->setCurrentIndex(index);
+        };
+        const auto compactQueue = [this, localQueue, updateQueue] {
+            const int oldSelection = localQueue->currentData().toInt();
+            QList<QStringList> rows;
+            int newSelection = 0;
+            for (int row = 1; row <= 10; ++row) {
+                auto *p1 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                auto *p2 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                if (!p1 || !p2 || !round) return;
+                const QStringList values{p1->text(), p2->text(), round->text()};
+                if (!values.at(0).trimmed().isEmpty() || !values.at(1).trimmed().isEmpty() || !values.at(2).trimmed().isEmpty()) {
+                    rows.append(values);
+                    if (row == oldSelection) newSelection = rows.size();
+                }
+            }
+            for (int row = 1; row <= 10; ++row) {
+                auto *p1 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                auto *p2 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                QSignalBlocker block1(p1), block2(p2), block3(round);
+                const QStringList values = row <= rows.size() ? rows.at(row - 1) : QStringList{QString(), QString(), QString()};
+                p1->setText(values.at(0)); p2->setText(values.at(1)); round->setText(values.at(2));
+            }
+            updateQueue();
+            const int index = localQueue->findData(newSelection);
+            if (index >= 0) localQueue->setCurrentIndex(index);
+        };
+        for (int row = 1; row <= 10; ++row) {
+            for (const QString &key : {QStringLiteral("p1"), QStringLiteral("p2"), QStringLiteral("round")}) {
+                if (auto *field = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-%2").arg(row).arg(key), nullptr))) {
+                    connect(field, &QLineEdit::textChanged, localQueue, [this, localQueue, updateQueue, compactQueue, row](const QString &) {
+                        updateQueue();
+                        auto *p1 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                        auto *p2 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                        auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                        if (p1 && p2 && round && p1->text().trimmed().isEmpty() && p2->text().trimmed().isEmpty() && round->text().trimmed().isEmpty())
+                            QTimer::singleShot(0, localQueue, [compactQueue] { compactQueue(); });
+                    });
+                }
+            }
+        }
+        updateQueue();
+        connect(localRecall, &QPushButton::clicked, localQueue, [this, localQueue, sggList, sggSend] {
+            const int row = localQueue->currentData().toInt();
+            if (row < 1 || row > 10) { QMessageBox::information(this, tr("Match queue"), tr("Select a queue entry first.")); return; }
+            auto *first = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+            auto *second = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+            auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+            if (!first || !second || !round || first->text().trimmed().isEmpty() || second->text().trimmed().isEmpty()) {
+                QMessageBox::warning(this, tr("Match queue"), tr("The queue entry needs both player names.")); return;
+            }
+            const QString firstValue = first->text(), secondValue = second->text(), roundValue = round->text();
+            QVariantMap data; data.insert(QStringLiteral("p1"), firstValue); data.insert(QStringLiteral("p2"), secondValue); data.insert(QStringLiteral("round"), roundValue);
+            const int previous = sggList->currentIndex();
+            sggList->addItem(tr("Queued match"), data); const int temporary = sggList->count() - 1; sggList->setCurrentIndex(temporary);
+            sggSend->setProperty("queueSendSucceeded", false); sggSend->click();
+            const bool success = sggSend->property("queueSendSucceeded").toBool();
+            sggList->removeItem(temporary); if (previous >= 0 && previous < sggList->count()) sggList->setCurrentIndex(previous);
+            if (!success) return;
+            if (first->text() == firstValue && second->text() == secondValue && round->text() == roundValue) {
+                first->clear(); second->clear(); round->clear();
+                statusBar()->showMessage(tr("Match recalled and queue row cleared. Save the dashboard to publish."), 12000);
+            } else QMessageBox::information(this, tr("Match queue"), tr("The queue row changed during recall, so it was retained."));
+        });
+        // Optional direct destination buttons for the selected local queue row.
+        for (const QString &destination : {QStringLiteral("main"), QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c"), QStringLiteral("d")}) {
+            auto *button = qobject_cast<QPushButton *>(visualList.value(QStringLiteral("schedule-local-send-") + destination, nullptr));
+            if (!button) continue;
+            connect(button, &QPushButton::clicked, localQueue, [this, destination, sggDestination, localRecall] {
+                const int destinationIndex = sggDestination->findData(destination);
+                if (destinationIndex < 0) { QMessageBox::warning(this, tr("Match queue"), tr("The scoreboard destination is missing from the layout.")); return; }
+                const int previousIndex = sggDestination->currentIndex();
+                sggDestination->setCurrentIndex(destinationIndex);
+                localRecall->click();
+                if (previousIndex >= 0 && previousIndex < sggDestination->count()) sggDestination->setCurrentIndex(previousIndex);
+            });
+        }
+    }
 
     //connect signal mappers
 
@@ -1749,8 +2491,6 @@ void MainWindow::parseLayout(QDomElement element, QWidget *parent) {
             panel->show();
         } else if (tagName == "tweet") {
             addTweetWidget(child.toElement(), parent);
-        } else if (tagName == "smashgg") {
-            addProviderWidget(child.toElement(), parent, widgetList, ProviderWidgetBuilder::Provider::Smashgg);
         } else if (tagName == "tabSet") {
             QString newTabSet = addTabWidget(child.toElement(), parent);
             parseTabLayout(child.toElement(), visualList[newTabSet]);
@@ -2073,6 +2813,7 @@ void MainWindow::addLabel(QDomElement element, QWidget *parent) {
     const QString mirrorFile = element.attribute("mirrorFile").trimmed();
     const QString mirrorPath = element.attribute("mirrorPath").trimmed();
     if (!mirrorFile.isEmpty() && !mirrorPath.isEmpty()) {
+        visualList[newLabel]->setProperty("scRemoteMirrorKey", mirrorFile + QLatin1Char('\n') + mirrorPath);
         QLabel *label = static_cast<QLabel *>(visualList[newLabel]);
         const QString fallback = element.text();
         auto *timer = new QTimer(label);
@@ -2080,10 +2821,10 @@ void MainWindow::addLabel(QDomElement element, QWidget *parent) {
         const auto updateMirror = [this, label, mirrorFile, mirrorPath, fallback] {
             QString path = mirrorFile;
             if (path == QStringLiteral("@schedule")) {
-                QSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("Schedule"));
+                PortableSettings settings(QStringLiteral("StreamControlPlus"), QStringLiteral("Schedule"));
                 path = settings.value(QStringLiteral("outputPath")).toString();
             } else if (path == QStringLiteral("@bingo")) {
-                QSettings bingoSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("BingoScores"));
+                PortableSettings bingoSettings(QStringLiteral("StreamControlPlus"), QStringLiteral("BingoScores"));
                 path = bingoSettings.value(QStringLiteral("outputPath")).toString();
             } else if (QFileInfo(path).isRelative()) {
                 path = QFileInfo(settings.value("layoutPath")).dir().filePath(path);
@@ -2287,6 +3028,12 @@ void MainWindow::addComboBox(QDomElement element, QWidget *parent) {
 
     }
 
+    const QString catalogFile = element.attribute("catalogFile").trimmed();
+    if (!catalogFile.isEmpty())
+        ((ScComboBox*)widgetList[newComboBox])->setProperty("scCatalogFile", catalogFile);
+    const QString catalogType = element.attribute("catalogType").trimmed();
+    if (!catalogType.isEmpty())
+        ((ScComboBox*)widgetList[newComboBox])->setProperty("scCatalogType", catalogType);
     QVariantList conditionalItems;
     const QString dependsOn = element.attribute("dependsOn").trimmed();
     if (!dependsOn.isEmpty() && !element.hasAttribute("dataSet")) {
@@ -2423,6 +3170,65 @@ void MainWindow::addRadioGroup(QDomElement element, QWidget *parent) {
 }
 
 void MainWindow::addButton(QDomElement element, QWidget *parent) {
+    if (element.attribute("type") == "startggQueueAction") {
+        const QString id = element.attribute("id");
+        auto *button = new QPushButton(element.text(), parent); button->setObjectName(id);
+        button->setGeometry(element.attribute("x").toInt(), element.attribute("y").toInt(), element.attribute("width").toInt(), element.attribute("height").toInt());
+        visualList[id] = button; widgetType[id] = "startggQueueAction";
+    } else if (element.attribute("type") == "matchHistory") {
+        const QString id = element.attribute("id");
+        const QString p1 = element.attribute("player1"), p2 = element.attribute("player2");
+        const QString round = element.attribute("round"), score1 = element.attribute("score1"), score2 = element.attribute("score2");
+        auto *button = new QPushButton(element.text(), parent);
+        button->setObjectName(id);
+        button->setProperty("remotePlayer1", p1); button->setProperty("remotePlayer2", p2);
+        button->setProperty("remoteScore1", score1); button->setProperty("remoteScore2", score2);
+        button->setGeometry(element.attribute("x").toInt(), element.attribute("y").toInt(), element.attribute("width").toInt(), element.attribute("height").toInt());
+        visualList[id] = button; widgetType[id] = "matchHistory";
+        connect(button, &QPushButton::clicked, this, [this, p1, p2, round, score1, score2] {
+            auto textFor = [this](const QString &key) -> QString {
+                QObject *object = widgetList.value(key, nullptr);
+                if (auto *line = qobject_cast<QLineEdit *>(object)) return line->text();
+                if (auto *combo = qobject_cast<QComboBox *>(object)) return combo->currentText();
+                if (auto *spin = qobject_cast<QSpinBox *>(object)) return QString::number(spin->value());
+                return QString();
+            };
+            QList<QLineEdit *> fields;
+            for (int row = 1; row <= 10; ++row) {
+                for (const QString &field : {QStringLiteral("p1"), QStringLiteral("p2"), QStringLiteral("round"), QStringLiteral("result")}) {
+                    auto *edit = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-history-%1-%2").arg(row).arg(field), nullptr));
+                    if (!edit) { QMessageBox::warning(this, tr("Match history"), tr("The layout needs all ten history rows with player, round, and result fields.")); return; }
+                    fields.append(edit);
+                }
+            }
+            if (textFor(p1).trimmed().isEmpty() || textFor(p2).trimmed().isEmpty() || !qobject_cast<QSpinBox *>(widgetList.value(score1, nullptr)) || !qobject_cast<QSpinBox *>(widgetList.value(score2, nullptr))) {
+                QMessageBox::warning(this, tr("Match history"), tr("Enter both player or team names and ensure score controls are present.")); return;
+            }
+            QString firstName = textFor(p1), secondName = textFor(p2);
+            if (p1 == QStringLiteral("scoreboard-player-1") && p2 == QStringLiteral("scoreboard-player-2")) {
+                const QString firstPartner = textFor(QStringLiteral("scoreboard-player-3")).trimmed();
+                const QString secondPartner = textFor(QStringLiteral("scoreboard-player-4")).trimmed();
+                if (!firstPartner.isEmpty()) firstName += QStringLiteral(" / ") + firstPartner;
+                if (!secondPartner.isEmpty()) secondName += QStringLiteral(" / ") + secondPartner;
+            }
+            const QStringList values = { firstName, secondName, textFor(round), textFor(score1) + QStringLiteral(" - ") + textFor(score2) };
+            for (int row = 9; row > 0; --row)
+                for (int col = 0; col < 4; ++col) fields[row * 4 + col]->setText(fields[(row - 1) * 4 + col]->text());
+            for (int col = 0; col < 4; ++col) fields[col]->setText(values[col]);
+            QStringList resetButtons;
+            if (p1 == QStringLiteral("scoreboard-player-1")) {
+                resetButtons = {QStringLiteral("scoreboard-clear-left"), QStringLiteral("scoreboard-clear-right"), QStringLiteral("scoreboard-clear-score")};
+            } else if (p1.startsWith(QStringLiteral("multi-player-1"))) {
+                const QString setup = p1.mid(QStringLiteral("multi-player-1").size());
+                if (setup.size() == 1 && QStringLiteral("abcd").contains(setup))
+                    resetButtons = {QStringLiteral("multi-clear-player-1") + setup, QStringLiteral("multi-clear-player-2") + setup, QStringLiteral("multi-clear-score-") + setup};
+            } else if (p1 == QStringLiteral("teams-team-1-name")) {
+                resetButtons = {QStringLiteral("teams-clear-left"), QStringLiteral("teams-clear-right"), QStringLiteral("teams-clear-score"), QStringLiteral("teams-clear-match-score")};
+            }
+            for (const QString &button : resetButtons) if (resetList.contains(button)) resetFields(button);
+            statusBar()->showMessage(tr("Match added to history and scoreboard cleared. Save the dashboard to publish it."), 10000);
+        });
+    } else 
     if (element.attribute("type") == "teamLoad" || element.attribute("type") == "teamSave" || element.attribute("type") == "teamDelete") {
         const QString id=element.attribute("id");
         auto *button=new QPushButton(element.text(),parent);
@@ -2642,7 +3448,91 @@ QJsonArray MainWindow::runRemoteActions(const QJsonArray &actions) {
         QJsonObject result;
         QString error;
         if (actionValue.isObject()) {
-            error = applyRemoteAction(actionValue.toObject());
+            const QJsonObject action = actionValue.toObject();
+            if (action.value(QStringLiteral("action")).toString() == QStringLiteral("snapshot")) {
+                QJsonObject snapshot, controls, datasets, mirrors;
+                QFile layoutFile(settings.value(QStringLiteral("layoutPath")));
+                if (!layoutFile.open(QIODevice::ReadOnly) || layoutFile.size() > 2 * 1024 * 1024) {
+                    error = QStringLiteral("Could not read active layout, or layout exceeds 2 MiB");
+                } else {
+                    snapshot.insert(QStringLiteral("layout"), QString::fromUtf8(layoutFile.readAll()));
+                    for (auto it = widgetList.cbegin(); it != widgetList.cend(); ++it) {
+                        const QString id = it.key(); const QString type = widgetType.value(id); QObject *object = it.value();
+                        QJsonObject control; control.insert(QStringLiteral("type"), type);
+                        if (auto *line = qobject_cast<QLineEdit *>(object)) control.insert(QStringLiteral("value"), line->text());
+                        else if (auto *combo = qobject_cast<QComboBox *>(object)) {
+                            control.insert(QStringLiteral("value"), id == QStringLiteral("schedule-startgg-queue") ? QString::number(combo->currentIndex()) : getValueByID(id));
+                            QJsonArray options;
+                            for (int i = 0; i < combo->count(); ++i) {
+                                const QVariant data = combo->itemData(i);
+                                QJsonObject option; option.insert(QStringLiteral("label"), combo->itemText(i));
+                                option.insert(QStringLiteral("value"), id == QStringLiteral("schedule-startgg-queue") ? QString::number(i) : (data.isNull() ? combo->itemText(i) : data.toString()));
+                                options.append(option);
+                            }
+                            control.insert(QStringLiteral("options"), options);
+                        } else if (auto *spin = qobject_cast<QSpinBox *>(object)) control.insert(QStringLiteral("value"), spin->value());
+                        else if (auto *check = qobject_cast<QCheckBox *>(object)) control.insert(QStringLiteral("value"), check->isChecked());
+                        else if (type == QStringLiteral("radioGroup") || type == QStringLiteral("tsButton")) control.insert(QStringLiteral("value"), getValueByID(id));
+                        else continue;
+                        if (auto *widget = qobject_cast<QWidget *>(object)) control.insert(QStringLiteral("enabled"), widget->isEnabled());
+                        controls.insert(id, control);
+                    }
+                    for (auto it = dataSets.cbegin(); it != dataSets.cend(); ++it) {
+                        QJsonArray columns;
+                        for (const QStringList &column : it.value()) columns.append(QJsonArray::fromStringList(column));
+                        datasets.insert(it.key(), columns);
+                    }
+                    for (auto it = visualList.cbegin(); it != visualList.cend(); ++it) {
+                        auto *label = qobject_cast<QLabel *>(it.value());
+                        if (!label) continue;
+                        const QString key = label->property("scRemoteMirrorKey").toString();
+                        if (!key.isEmpty()) mirrors.insert(key, label->text());
+                    }
+                    snapshot.insert(QStringLiteral("mirrors"), mirrors);
+                    if (auto *dialog = findChild<QDialog *>(QStringLiteral("sc-remote-schedule")))
+                        snapshot.insert(QStringLiteral("schedule"), static_cast<ScheduleDialog *>(dialog)->remoteState());
+                    if (auto *dialog = findChild<QDialog *>(QStringLiteral("sc-remote-timers")))
+                        snapshot.insert(QStringLiteral("timers"), static_cast<BroadcastControl *>(dialog)->remoteState());
+                    snapshot.insert(QStringLiteral("controls"), controls);
+                    snapshot.insert(QStringLiteral("datasets"), datasets);
+                    result.insert(QStringLiteral("data"), snapshot);
+                }
+            } else if (action.value(QStringLiteral("action")).toString() == QStringLiteral("schedule_control")) {
+                auto *dialog = findChild<QDialog *>(QStringLiteral("sc-remote-schedule"));
+                if (!dialog) error = QStringLiteral("Schedule controls are unavailable");
+                else error = static_cast<ScheduleDialog *>(dialog)->remoteAction(action.value(QStringLiteral("command")).toString());
+            } else if (action.value(QStringLiteral("action")).toString() == QStringLiteral("timer_control")) {
+                auto *dialog = findChild<QDialog *>(QStringLiteral("sc-remote-timers"));
+                if (!dialog) error = QStringLiteral("Timer controls are unavailable");
+                else error = static_cast<BroadcastControl *>(dialog)->remoteAction(action.value(QStringLiteral("command")).toString(), action);
+            } else if (action.value(QStringLiteral("action")).toString() == QStringLiteral("dataset_select")) {
+                const QString id = action.value(QStringLiteral("id")).toString();
+                auto *master = qobject_cast<ScLineEdit *>(widgetList.value(id, nullptr));
+                const int row = action.value(QStringLiteral("row")).toInt(-1);
+                if (!master || !dataAssoc.contains(id) || row < 0) error = QStringLiteral("Invalid dataset field or row");
+                else {
+                    const QString dataset = master->getDataSetName();
+                    const QList<QStringList> columns = dataSets.value(dataset);
+                    const int masterCol = dataAssoc.value(id);
+                    if (dataset.isEmpty() || masterCol < 0 || masterCol >= columns.size() || row >= columns.at(masterCol).size() || columns.at(masterCol).at(row) != action.value(QStringLiteral("expected")).toString()) error = QStringLiteral("Dataset changed; refresh and select again");
+                    else {
+                        bool valid = true;
+                        for (const QString &slave : dataMaster.value(id)) {
+                            const int col = dataAssoc.value(slave, -1);
+                            if (col < 0 || col >= columns.size() || row >= columns.at(col).size()) { valid = false; break; }
+                        }
+                        if (!valid) error = QStringLiteral("Dataset row is incomplete");
+                        else {
+                            master->setText(columns.at(masterCol).at(row));
+                            for (const QString &slave : dataMaster.value(id)) {
+                                const QString value = columns.at(dataAssoc.value(slave)).at(row);
+                                if (auto *line = qobject_cast<QLineEdit *>(widgetList.value(slave, nullptr))) line->setText(value);
+                                else if (auto *combo = qobject_cast<QComboBox *>(widgetList.value(slave, nullptr))) combo->setEditText(value);
+                            }
+                        }
+                    }
+                }
+            } else error = applyRemoteAction(action);
         } else {
             error = "action must be an object";
         }
@@ -2675,7 +3565,24 @@ QString MainWindow::applyRemoteAction(const QJsonObject &action) {
         return "unknown widget '" + id + "'";
 
     if (actionName == "press") {
-        if (wType == "resetButton") {
+        if (wType == "startggQueueAction" && id == QStringLiteral("schedule-startgg-add")) {
+            auto *queue = qobject_cast<QComboBox *>(widgetList.value(QStringLiteral("schedule-startgg-queue"), nullptr));
+            if (!queue || queue->currentData().toMap().isEmpty()) return "Select a Start.gg match first";
+            const QVariantMap match = queue->currentData().toMap();
+            for (int row = 1; row <= 10; ++row) {
+                auto *p1 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p1").arg(row), nullptr));
+                auto *p2 = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-p2").arg(row), nullptr));
+                auto *round = qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-queue-%1-round").arg(row), nullptr));
+                if (!p1 || !p2 || !round) return "The layout is missing queue fields";
+                if (p1->text().trimmed().isEmpty() && p2->text().trimmed().isEmpty() && round->text().trimmed().isEmpty()) {
+                    p1->setText(match.value(QStringLiteral("p1")).toString());
+                    p2->setText(match.value(QStringLiteral("p2")).toString());
+                    round->setText(match.value(QStringLiteral("round")).toString());
+                    return QString();
+                }
+            }
+            return "All ten queue rows are occupied";
+        } else if (wType == "resetButton") {
             resetFields(id);
         } else if (wType == "swapButton") {
             swapFields(id);
@@ -2683,6 +3590,21 @@ QString MainWindow::applyRemoteAction(const QJsonObject &action) {
             tsClick(id);
         } else if (wType == "setButton") {
             setButtonClick(id);
+        } else if (wType == "matchHistory") {
+            auto *button = qobject_cast<QPushButton *>(visualList.value(id));
+            if (!button) return "invalid match history button";
+            const auto playerText = [this](const QString &key) -> QString {
+                QObject *object = widgetList.value(key, nullptr);
+                if (auto *line = qobject_cast<QLineEdit *>(object)) return line->text();
+                if (auto *combo = qobject_cast<QComboBox *>(object)) return combo->currentText();
+                return QString();
+            };
+            if (playerText(button->property("remotePlayer1").toString()).trimmed().isEmpty() || playerText(button->property("remotePlayer2").toString()).trimmed().isEmpty() ||
+                !qobject_cast<QSpinBox *>(widgetList.value(button->property("remoteScore1").toString(), nullptr)) || !qobject_cast<QSpinBox *>(widgetList.value(button->property("remoteScore2").toString(), nullptr)))
+                return "Enter both players and ensure the score controls exist";
+            for (int row = 1; row <= 10; ++row) for (const QString &field : {QStringLiteral("p1"), QStringLiteral("p2"), QStringLiteral("round"), QStringLiteral("result")})
+                if (!qobject_cast<QLineEdit *>(widgetList.value(QStringLiteral("schedule-history-%1-%2").arg(row).arg(field), nullptr))) return "The layout needs ten complete match history rows";
+            button->click();
         } else if (wType == "scoreStep") {
             auto *button = qobject_cast<QPushButton *>(visualList.value(id));
             if (!button || widgetType.value(button->property("scoreTarget").toString()) != "spinBox") return "invalid score target for '" + id + "'";
@@ -2738,6 +3660,12 @@ QString MainWindow::applyRemoteAction(const QJsonObject &action) {
             return "value for '" + id + "' must be true/false or 1/0";
         }
         ((QCheckBox*)widgetList[id])->setChecked(checked);
+    } else if (wType == "comboBox" && id == QStringLiteral("schedule-startgg-queue")) {
+        auto *combo = qobject_cast<QComboBox *>(widgetList.value(id, nullptr));
+        bool ok = false; const int index = valueStr.toInt(&ok);
+        if (!combo || !ok || index < 0 || index >= combo->count()) return "Invalid Start.gg queue selection";
+        if (combo->itemText(index) != action.value(QStringLiteral("expectedLabel")).toString()) return "Start.gg queue changed; wait for a refresh and select again";
+        combo->setCurrentIndex(index);
     } else if (wType == "comboBox") {
         if (!setComboValue(id, valueStr))
             return "'" + valueStr + "' is not an item of '" + id + "'";
@@ -3277,6 +4205,8 @@ void MainWindow::clearMaps() {
     swapSets.clear();
     swapList.clear();
     dataSets.clear();
+    condensedDataSets.clear();
+    completerList.clear();
     dataAssoc.clear();
     dataMaster.clear();
     resetMapper = new QSignalMapper (this) ;
